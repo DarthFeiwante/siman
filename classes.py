@@ -1,222 +1,1909 @@
-"""
-The most important header. Should be always first
-"""
-from header import *
-import header
-from functions import (local_surrounding, image_distance, xred2xcart, xcart2xred, 
-write_xyz, element_name_inv, write_lammps, calculate_voronoi, replic,
-log_history)
-
-import optparse
+# -*- coding: utf-8 -*- 
+#Copyright Aksyonov D.A
+from __future__ import division, unicode_literals, absolute_import, print_function
+import itertools, os, copy, math, glob, re, shutil, sys, pickle, gzip, shutil
 import re
-import glob
+
+from small_functions import angle, is_string_like
+
+#additional packages
+try:
+    from tabulate import tabulate
+except:
+    print('tabulate is not avail')
+try:
+    import pandas as pd
+except:
+    print('pandas is not avail')
+
+# import pymatgen
+# sys.exit()
+
+try:
+    import pymatgen
+    from pymatgen.io.cif import CifWriter
+    from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
+    from pymatgen.core.surface import Slab
+    from pymatgen.core.composition import Composition
+    pymatgen_flag = True
+except:
+    print('pymatgen is not avail')
+    pymatgen_flag = False
+
+import numpy as np
+# import matplotlib.pyplot as plt
 
 
-import sys
-import colorsys
-import shelve
+#siman packages
+import header
+from header import printlog, print_and_log, runBash, plt
+
+from small_functions import cat_files, grep_file, red_prec, list2string, is_list_like
+from functions import (read_vectors, read_list, words,
+     element_name_inv, invert, calculate_voronoi,
+    get_from_server, push_to_server, run_on_server, smoother, file_exists_on_server)
+from inout import write_xyz, write_lammps, read_xyz
+from small_functions import makedir
+from geo import calc_recip_vectors, calc_kspacings, xred2xcart, xcart2xred, local_surrounding, determine_symmetry_positions
+from geo import  image_distance, replic
 
 
 
-# from ase.utils.eos import EquationOfState
-import matplotlib.pyplot as plt
-plt.rcParams['mathtext.fontset'] = "stix"
+"""
+Classes used in siman
+TODO:
+1. Please  combine calculate_nbands(), calc_kspacings(), magmom filling in make incar  with actualize_set() 
+2. split make_incar_and_copy_all() into make_incar() and copy_calc_files_to_cluster()
+3. split .read_results() into download_output_files() and .parse_outcar() and .analyze_output()
+4. outcar name should be returned by write_sge_script in all cases and used, now only in u_ramping
+5. write_sge() - в режиме inherit_option = continue - предыдущие outcar резервируются только один
+раз с префиксом prev, повторный запуск перезатрет их, поэтому нужно писать спец код
+типа
+if test -f prev1.outcar
+    cp name prev2+name
+чтобы она находила prev3 с максимальным числом, и к этому числу прибавляла единицу для нового файла
 
-# print header.calc
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-def words(fileobj):
-    """Generator of words. However does not allow to use methods of list for returned"""
-    for line in fileobj:
-        for word in line.split():
-            yield word
-
-def read_vectors(token, number_of_vectors, list_of_words):
-    """Returns the list of numpy vectors for the last match"""
-
-    number_of_matches = list_of_words.count( token )
-    if number_of_matches == 0: 
-        #print_and_log("Warning token '"+token+"' was not found! return empty\n")
-        return [None]
-
-    if number_of_matches > 1:
-        print_and_log("Warning token '"+token+"' was found more than one times\n")
-        raise RuntimeError
+NEW:
+Calculation Structure():
+    *self.magmom* (list) - magnetic moments for each ion in structure; has higher preference than self.set.magnetic_moments which
+    include only moments for atom types
 
 
-    index = list_of_words.index(token, number_of_matches - 1 )     #Return the index of the last match
-    #print list_of_words[index]
-    list_of_vectors = []
-    vector = np.zeros((3))
-    for i in range(number_of_vectors):
-        vector[0] = float(list_of_words[index + 1])
-        vector[1] = float(list_of_words[index + 2])
-        vector[2] = float(list_of_words[index + 3])
-        index+=3
-        list_of_vectors.append(vector.copy())
-    return list_of_vectors
+"""
 
 
-def read_list(token, number_of_elements, ttype, list_of_words):
-    """Input is token to find, number of elements to read, type of elements and list of words, 
-    where to search
-    Returns the list of elements for the last match"""
-    
+class cd:
+    """Context manager for changing the current working directory"""
+    def __init__(self, newPath):
+        self.newPath = os.path.expanduser(newPath)
 
-    number_of_matches = list_of_words.count( token )
+    def __enter__(self):
+        self.savedPath = os.getcwd()
+        os.chdir(self.newPath)
 
-
-    
-    #if number_of_elements == 0:        raise RuntimeError
-    
-    if number_of_matches > 1:
-        print_and_log("Warning token '"+token+"' was found more than one times\n")
-        raise RuntimeError
-
-    if number_of_matches == 0 or number_of_elements == 0: 
-        #print_and_log("Warning token '"+token+"' was not found or asked number of elements is zero! set to [None]\n")
-        #if ttype == str:
-        #    return ['']*number_of_elements
-        #else:
-        #    return [0]*number_of_elements
-        return [None]
-
-    try:
-        index = list_of_words.index(token, number_of_matches - 1 )     #Return the index of the last match
-
-    except ValueError: 
-        print_and_log("Warning!, token "+token+" was not found. I return [None]!\n")
-        return [None]
-    
-    index+=1 #the position of token value
-    list_of_elements = []
-    
-    #define function dependig on type:
-
-    if   ttype == int  : 
-        def convert(a): return int(a)
-    elif ttype == float: 
-        def convert(a): return float(a)
-    elif ttype == str  : 
-        def convert(a): return str(a)
-    
-    #print list_of_words[index], type(list_of_words[index])
-    if list_of_words[index] == "None"  : 
-        def convert(a): return [None]
-    
-    #Make convertion
-    for i in range(number_of_elements):
-        
-        list_of_elements.append(    convert(  list_of_words[index]   )     )
-        index+=1
+    def __exit__(self, etype, value, traceback):
+        os.chdir(self.savedPath)
 
 
-    return list_of_elements
 
-def read_database(scratch = False):
-    #2. Read database of calculations
-    #global history; 
-    #global struct_des;
-    databasefile = 'calc.s'
-    if scratch == True: databasefile =   '/scratch/aksenov/calc.s'
-    
-    log.write("\nLaunch at "+str( datetime.datetime.today() )+'\n')
-    d = shelve.open(databasefile, protocol=1)
-    try:
-        calc = d['calc']; 
-        conv = d['conv']; 
-        varset = d['varset']; 
-        header.history = d['history']
-        #struct_des = d['struct_des']
-        #print struct_des 
-       #
-    except KeyError: 
-        try: calc = d['calc'] #dictionary of calculations
-        except KeyError:
-            log.write( "There is no database of calculations. I create new"); calc = {}
-        try: conv = d['conv'] #dictionary of convergence lists
-        except KeyError:
-            log.write( "There is no dictionary of convergence lists. I create new"); conv = {}   
-        try: varset = d['varset'] 
-        except KeyError:
-            log.write( "There is no dictionary of inputsets. I create new");  varset = {} 
-        try: header.history = d['history'] 
-        except KeyError:
-            log.write( "There is still no history in database. The list is in header module ");  #history = [] 
-        #try: struct_des = d['struct_des'] 
-        #except KeyError:
-            #log.write( "There is still no struct_des in database. The dict is global "); # struct_des = {} 
 
-    d.close()
-    #print history
 
-    return calc,conv,varset,sys.getsizeof(d)
-def write_database(calc,conv,varset,size_on_start):
-    #size_on_finish = sys.getsizeof(dbase)
-    #if size_on_finish != size_on_start:
-    runBash("cp calc.s calc_copy.s") #create copy before writing
-    d = shelve.open('calc.s', protocol=1) #Write database of calculations
-    #print struct_des 
-    d['calc'] = calc
-    d['conv'] = conv
-    d['varset'] = varset
-    d['history'] = header.history
-    #d['struct_des'] = struct_des 
 
-    d.close()
-    log.write("\nEnd of work at "+str(datetime.datetime.now())+'\n')
-    log.close()
-    with  open('history','w') as his:
-        #print history
-        for i in header.history:
-            #print i
-            his.write(i+"\n")
-    print("\nDatabase was succesfully updated\n")
-    return
+class Description():
+    """
+    Objects of this class include just folder and description of specific calculation.
+    Mostly was needed for manual addition of new calculations
 
+    self.ngkpt_dict_for_kspacings (dict of lists) - the key is kspacing; the dict
+    contains k-meshes 
+    for all calculations
+    based on this geometry structure.
+    can be useful for fine tuning of k-mesh for specific kspacing.
+
+    """
+    def __init__(self, sectionfolder = "forgot_folder", description = "forgot_description"):
+        self.des = description
+        self.sfolder = sectionfolder
+        self.ngkpt_dict_for_kspacings = {} #the key is kspacing
+
+
+
+
+class empty_struct():
+    def __init__(self):
+        pass
 
 class Structure():
     """This class includes only structure related information such as primitive vectors, coordinates, forces and so on"""
     def __init__(self):
         self.name = ""
         self.des = ''
-        self.rprimd = [np.zeros((3)) for i in 0,1,2]
+        self.hex_a = None
+        self.hex_c = None
+        self.gbpos = None
+        self.rprimd = [np.zeros((3)) for i in [0,1,2] ]
         self.xcart = []
         self.xred = []
+        self.magmom = []
+        self.select = [] # flags for selective dynamics
+        # self.pos = write_poscar()
+
+    def copy(self):
+        return copy.deepcopy(self)
+
+    def new(self):
+        return Structure()
+
+    def selective_all(self):
+        st = copy.deepcopy(self)
+        # if hasattr(self, 'select'):
+        st.select = []
+        for i in range(st.natom):
+            st.select.append([True,True,True])
+            # print('9')
+        # print(st.select)
+        return st 
+
+    def check_selective(self):
+        """
+        check if some atoms should be frozen
+        """
+        selective_dyn = False
+        if self.select is not None:
+            for sel in self.select:
+                # print (not all(sel))
+                if not all(sel):
+                    selective_dyn = True
+        return selective_dyn
+
+    def selective_byCompare(self, st2, tol = 0.0001, freeze = 'present' ):
+        """
+        set selective dynamics falgs in the calling structure (self) by freezing the atoms that are present (or missing) in the supplied structure (st2)
+        tol - tolerance for finding the same atoms in the two structures
+        freeze = 'present' or 'missing'
+
+        TODO:
+        read st2 from file
+        optional save flag-changed atoms to cif (to check the result)
+
+        """
+        st1 = copy.deepcopy(self)
+        if freeze == 'missing':
+            flag_change = [True, True, True]
+            flag_default = [False, False, False]
+        else:
+            flag_change = [False, False, False]
+            flag_default = [True, True, True]
+            if freeze != 'present':
+                print('Warning! incorrect \'freeze\' argument, \'presnt\' is used')
+
+        tol = tol ** 2  # ^2 tol instead sqrt(dist)
+
+        totNatom1 = len(st1.typat)
+        totNatom2 = len(st1.typat)
+        if totNatom2 > totNatom1:
+            printlog('Warning! struct to compare with has more atoms than original struct!')
+
+        st1.select = [flag_default] * totNatom1
+
+        natom1 = {} # dictionary of atom types (by znucl); each entry contains list of atom nubers of certain type
+        for i, atype in enumerate(st1.typat):
+            if st1.znucl[atype-1] in natom1:
+                natom1[st1.znucl[atype-1]].append(i)
+            else:
+                natom1[st1.znucl[atype-1]] = [i]
+
+        natom2 = {}  # dictionary of atom types (by znucl); each entry contains list of atom nubers of certain type
+        for i, atype in enumerate(st2.typat):
+            if st2.znucl[atype-1] in natom2:
+                natom2[st2.znucl[atype-1]].append(i)
+            else:
+                natom2[st2.znucl[atype-1]] = [i]
+
+        for ztype in natom2:
+            for i2 in natom2[ztype]:
+                for k, i1 in enumerate(natom1[ztype]):
+                    dist = np.sum(np.square(st1.xred[i1] - st2.xred[i2])) # square distance between compared atoms
+                    if dist < tol:
+                        st1.select[i1] = flag_change # change SD flags for if the atoms are identical
+                        del (natom1[ztype][k])
+        return st1
+
+    def fix_layers(self, xred_range, highlight = False):
+        """
+        fix atoms in layers normal to R3
+
+        xred_range (list) [from, to]
+        highlight - replace with Pu to check
+
+        """
+        st = copy.deepcopy(self)
+        if not hasattr(st, 'select'):
+            st = st.selective_all()
+        fixed = []
+        for i, xr in enumerate(st.xred):
+            if xred_range[0]  < xr[2] < xred_range[1]:
+                st.select[i] = [0, 0, 0] # fix
+                fixed.append(i)
+        if highlight:
+            st = st.replace_atoms(fixed, 'Pu')
 
 
-class Calculation():
-    """docstring for Calculation"""
-    def __init__(self, inset = None):
+        st.name+='_fix'
+        return st
+
+
+
+
+
+    def get_layers_pos(self, xred_range):
+        #return layer positions along vector 3 in xred_range
+        st = self
+        zred_req = []
+
+        for i, xr in enumerate(st.xred):
+            z =xr[2]
+            if xred_range[0]  < z < xred_range[1]:
+                if len(zred_req) == 0:
+                    zred_req.append(z)
+
+                m = min(np.abs(np.array(zred_req) - z))
+                # print()
+                if m > 0.05/np.linalg.norm(st.rprimd[2]): #tolerance 0.1 A
+                    zred_req.append(xr[2])
+        z_unique = sorted(zred_req)
+        return z_unique
+
+
+
+
+
+
+    def xcart2xred(self,):
+        self.xred = xcart2xred(self.xcart, self.rprimd)
+        self.natom = len(self.xred)
+    def update_xred(self,):
+        self.xred = xcart2xred(self.xcart, self.rprimd)
+        self.natom = len(self.xred)
+
+
+    def xred2xcart(self,):
+        self.xcart = xred2xcart(self.xred, self.rprimd)
+
+    def update_xcart(self,):
+        self.xcart = xred2xcart(self.xred, self.rprimd)
+
+    def exchange_axes(self, i1_r, i2_r):
+        """
+        
+        """
+        st = copy.deepcopy(self)
+        r = copy.deepcopy(st.rprimd)
+
+        st.rprimd[i1_r] = r[i2_r]
+        st.rprimd[i2_r] = r[i1_r]
+
+        st.update_xred()
+
+        return st
+
+
+
+
+    def get_volume(self):
+        self.vol = np.dot( self.rprimd[0], np.cross(self.rprimd[1], self.rprimd[2])  ); #volume
+        return self.vol
+
+    def get_recip(self):
+        """Calculate reciprocal vectors"""
+        self.recip = calc_recip_vectors(self.rprimd)
+        return self.recip
+
+    def get_nznucl(self):
+        """list of numbers of atoms of each type, order is not important
+            updated directly
+        """
+        self.nznucl = []
+        for typ in range(1,self.ntypat+1):
+            self.nznucl.append(  self.typat.count(typ) )
+        return self.nznucl
+
+    def get_elements(self):
+        #return list of elements names
+        return [element_name_inv(self.znucl[t-1]) for t in self.typat]
+
+    def get_elements_z(self):
+        #return list of elements names
+        return [self.znucl[t-1] for t in self.typat]
+
+    def get_elements_zval(self):
+        #return list with number of valence electrons for each element
+        zvals = []
+        for z in self.get_elements_z():
+            i = self.znucl.index(z)
+            zv = self.zval[i]
+            zvals.append(zv)
+        return zvals
+
+    def determine_symmetry_positions(self, element):
+        from geo import determine_symmetry_positions
+
+        return determine_symmetry_positions(self, element)
+
+
+    def get_maglist(self):
+        #return bool list of which  elements are magnetic (here all transition metals are searched!)
+        #and dictionary with numbers of each transition metal
+        ifmaglist = []
+        zlist = self.get_elements_z()
+        mag_numbers = {}
+        for i, z in enumerate(zlist): #
+            if z in header.TRANSITION_ELEMENTS:
+                if z not in mag_numbers:
+                    mag_numbers[z] = []
+                ifmaglist.append(True)
+                mag_numbers[z].append(i)
+            else:
+                ifmaglist.append(False)
+        ifmaglist = np.array(ifmaglist)
+
+        return ifmaglist, mag_numbers
+
+
+    def set_magnetic_config(self, element, moments):
+        #set magnetic configuration based on symmetry non-equivalent positions
+        # element (str) - elements for which moments should be set 
+        # moments (list) - list of moments for non-equivalent positions - the same order as in determine
+        #                  the length should be the same as number of unique postions
+
+        st = copy.deepcopy(self)
+
+        if not hasattr(st, 'magmom') or None in st.magmom:
+            magmom = [0.6]*st.natom
+        else:
+            magmom = st.magmom
+
+        pos = st.determine_symmetry_positions(element)
+
+        for j, p in enumerate(pos):
+            for i in p:
+                magmom[i] = moments[j]
+
+        # print(magmom)
+        st.magmom = magmom
+
+        return st
+
+    def convert2pymatgen(self, oxidation = None, slab = False):
+        """
+        oxidation (dict) - {'Ti':'Ti3+'}
+
+        slab - if True return slab object is returned - limited functional is implemented
+        """
+        site_properties = {}
+
+        if hasattr(self, 'magmom') and any(self.magmom):
+            site_properties["magmom"] = self.magmom
+
+
+
+
+
+
+
+        if oxidation is None:
+            elements = self.get_elements()
+        else:
+            elements = [oxidation[el] for el in self.get_elements()]
+
+        if slab:
+            # print(dir(pymatgen.core))
+            pm = Slab(self.rprimd, elements, self.xred, 
+                miller_index = [0,0,1], oriented_unit_cell = None, shift = None, scale_factor = None,reorient_lattice = False,
+                site_properties = site_properties)
+        else:
+            # print(elements)
+            # print(len(self.xred))
+            # print(site_properties)
+
+            pm = pymatgen.Structure(self.rprimd, elements, self.xred, site_properties = site_properties)
+
+
+        if hasattr(self, 'charges') and any(self.charges):
+
+            if 1: #normalize charges
+                t = sum(self.charges)/len(self.charges)
+                chg = [c-t for c in self.charges ]
+                # print(t)
+            else:
+                chg = self.charges
+
+            pm.add_oxidation_state_by_site(chg)
+
+
+        return pm
+
+
+
+
+
+
+
+    def get_pm_composition(self):
+        ''
+        pm = self.convert2pymatgen()
+        cm = Composition(pm.formula)
+        return cm
+
+
+    def get_reduced_formula(self):
+        ''
+        pm = self.convert2pymatgen()
+        cm = Composition(pm.formula)
+        # cm = Composition(self.get_elements())
+        return cm.reduced_formula
+
+    def get_formula(self):
+        ''
+        # pm = self.convert2pymatgen()
+        # cm = Composition(pm.formula)
+        # cm = Composition(self.get_elements())
+        return self.convert2pymatgen().formula
+
+    def get_reduced_composition(self):
+        ''
+        pm = self.convert2pymatgen()
+        cm = Composition(pm.formula)
+        # cm = Composition(self.get_elements())
+        return cm.reduced_composition
+
+    def get_reduced_formula_and_factor(self):
+        pm = self.convert2pymatgen()
+        cm = Composition(pm.formula)
+        # cm = Composition(self.get_elements())
+        return cm.get_reduced_formula_and_factor()
+
+    def get_fractional_composition(self):
+        pm = self.convert2pymatgen()
+
+        cm = Composition(pm.formula)
+        # cm = Composition(self.get_elements())
+        return cm.fractional_composition
+
+    def update_types(self, elements):
+        # update typat, ntypat, znucl, nznucl from elements - list of elements names
+        st = copy.deepcopy(self)
+        st.ntypat = len(set(elements))
+
+        st.typat = []
+        st.znucl = []
+        unique = []
+        curtyp = 0
+        types = {}
+        for el in elements:
+            if el not in unique:
+                curtyp += 1
+                types[el] = curtyp
+                if is_string_like(el):
+                    z = invert(el)
+                else:
+                    z = el
+
+                st.znucl.append(z)
+                # nznucl.append(0)
+                unique.append(el)
+            st.typat.append(types[el])
+        
+        st.get_nznucl()
+
+        # print(st.ntypat, st.typat, st.nznucl, st.znucl)
+
+        return st
+
+    def update_from_pymatgen(self, stpm):
+        """
+        stpm - pymatgen structure
+        update the current structure from pymatgen structure
+        only rprimd, xred and xcart are updated now!!!!!
+
+        TODO:
+
+
+        """
+        st = copy.deepcopy(self)
+        st.rprimd = [np.array(vec) for vec in stpm._lattice._matrix]
+        st.xred   = [np.array(site._fcoords) for site in stpm._sites]
+        
+
+        # print(elements)
+        st.update_xcart()
+
+        s = stpm._sites[0]
+
+        if 'magmom' in s.properties:
+            st.magmom = [site.properties['magmom'] for site in stpm._sites]
+        else:
+            st.magmom = [None]
+        # print( dir(s._lattice) )
+        # print( dir(s) )
+        # print( s.properties )
+        # print( s._properties )
+        # print( dir(s.specie) )
+        # print( s.specie.name )
+        # sys.exit()
+        elements = [s.specie.name for s in stpm._sites]
+        # print(s.specie.oxi_state)
+        if hasattr(s.specie, 'oxi_state'):
+            charges = [s.specie.oxi_state for s in stpm._sites]
+            st.charges = charges
+        
+        # if hasattr(s.specie, 'oxi_state'):
+        #     charges = [s.specie.oxi_state for s in stpm._sites]
+        #     st.charges = charges
+
+
+        # print(st.charges)
+        # else:
+        #     charges = [None]
+        # print(elements)
+        # print(charges)
+        # sys.exit()
+
+        st = st.update_types(elements)
+
+        st.natom = len(st.typat)
+        # sys.exit()
+
+        if st.natom != len(st.xred):
+            printlog('Error! number of atoms was changed, please improve this method')
+
+        st.name+='_from_pmg'
+        return st
+
+
+    def rotate(self, axis, angle):
+        #axis - list of 3 elements, [0,0,1]
+        #angle in degrees
+        
+        from pymatgen.transformations.standard_transformations import RotationTransformation
+        
+        st = copy.deepcopy(self)
+        rot = RotationTransformation(axis, angle)
+        stpm = st.convert2pymatgen()
+        stpmr1 = rot.apply_transformation(stpm)
+        st_r1 = st.update_from_pymatgen(stpmr1)
+        return st_r1
+
+
+    def invert_axis(self, axis):
+        st = copy.deepcopy(self)
+
+        st.rprimd[axis] *= -1
+        st.update_xred()
+        st = st.return_atoms_to_cell()
+        return st
+
+
+
+
+
+
+
+
+
+
+
+    def get_conventional_cell(self):
+        """
+        return conventional cell 
+        """
+        st_mp = self.convert2pymatgen()
+
+        # st_test = self.update_from_pymatgen(st_mp)
+        # st_test.printme()
+
+        sf = SpacegroupAnalyzer(st_mp, ) #symprec = 0.1
+
+        sc = sf.get_conventional_standard_structure() # magmom are set to None
+
+        # print(sc)
+        st = self.update_from_pymatgen(sc)
+
+        # print(st.rprimd)
+        # print(len(st.xcart))
+        # print(st.ntypat)
+
+        return st
+
+
+
+
+    def get_primitive_cell(self):
+        """
+        return primitive cell 
+        """
+        st_mp = self.convert2pymatgen()
+
+        sf = SpacegroupAnalyzer(st_mp, ) #symprec = 0.1
+
+        sc = sf.get_primitive_standard_structure() # magmom are set to None
+
+        st = self.update_from_pymatgen(sc)
+
+
+        return st
+
+
+    def get_surface_atoms(self, element, surface = 0, surface_width = 0.5 ):
+        #return numbers of surface atoms
+        #elememt - which element is interesting?
+        #surface_width - which atoms to consider as surface 
+        #surface (int) - 0 or 1 - one of two surfaces; surface 1 has lowest z coordinate
+        st = self
+        surface_atoms = [[],[]]
+        
+        z1 = 100
+        z2 = -100
+        z = []
+        for x in st.xcart:
+            if z1 > x[2]:
+                z1 = x[2]
+            if z2 < x[2]:
+                z2 = x[2]
+
+        printlog('Surfaces are ', z1, z2)
+
+        z.append(z1)
+        z.append(z2)
+        els = st.get_elements()
+
+
+        for i, x in enumerate(st.xcart):
+            el = els[i]
+            if el == element:
+                # print(x[2])
+                if z1 <= x[2] < z1+surface_width:
+                    surface_atoms[0].append(i)
+
+                if z2 - surface_width  < x[2] <= z2:
+                    surface_atoms[1].append(i)
+
+
+        return surface_atoms[surface]
+
+
+
+
+
+
+    def printme(self):
+        print(self.convert2pymatgen())
+        return 
+
+    def get_space_group_info(self, symprec = None):
+        
+        default = 0.01
+        if not symprec:
+            symprec = default
+
+        if hasattr(self, 'spg') and symprec == default:
+            spg = self.spg
+        else:
+            p = self.convert2pymatgen()
+            spg = p.get_space_group_info(symprec)
+        # p = self.convert2pymatgen()
+
+        # print(p.get_symmetry_operations(symprec))
+
+
+        return spg
+
+    def sg(self,symprec = None, silent = 0):
+        try:
+            s = self.get_space_group_info(symprec)
+        except:
+            s = 'error'
+        if not silent:
+            print(s)
+        return s
+
+    def get_angles(self):
+        R = self.rprimd
+        alpha = angle(R[1], R[2])
+        beta  = angle(R[0], R[2])
+        gamma = angle(R[0], R[1])
+        return alpha, beta, gamma
+
+    # def __str__(self):
+    #     # print(self.convert2pymatgen())
+    #     return 
+
+
+    def get_element_xred(self, element):
+        """
+        Get xred of *element* first occurance
+        """
+        i = self.get_elements().index(element)
+        return self.xred[i]
+    
+    def get_element_xcart(self, element):
+        """
+        Get xred of *element* first occurance
+        """
+        i = self.get_elements().index(element)
+        
+        return self.xcart[i]
+
+    def get_transition_elements(self, fmt = 'names'):
+        """Returns list of transition elements (chemical names or z) in the structure
+        fmt - 
+            'names'
+            'z'
+            'n' - numbers of atoms
+        """
+        el = self.get_elements()
+        tra = []
+        ns = []
+        for i, e in enumerate(el):
+            for t in header.TRANSITION_ELEMENTS:
+                if e == invert(t):
+                    tra.append(e)
+                    ns.append(i)
+        
+        if fmt == 'z':
+            tra = [invert(t) for t in tra]
+        elif fmt == 'n':
+            tra = ns
+        return tra
+
+    def get_specific_elements(self, required_elements = None, fmt = 'n', ):
+        """Returns list of specific elements (chemical names or z) in the structure
+        fmt - 
+            'names'
+            'z'
+            'n' - numbers of atoms
+        
+        required_elements - list of elements of interest
+
+        """
+        el = self.get_elements()
+        tra = []
+        ns = []
+        for i, e in enumerate(el):
+            for t in required_elements:
+                if e == invert(t):
+                    tra.append(e)
+                    ns.append(i)
+        
+        if fmt == 'z':
+            tra = [invert(t) for t in tra]
+        elif fmt == 'n':
+            tra = ns
+        return tra
+
+
+
+
+
+    def add_atoms(self, atoms_xcart, element = 'Pu', return_ins = False, selective = None):
+        """
+        appends at the end if element is new. Other case insertered according to VASP conventions
+        Updates ntypat, typat, znucl, nznucl, xred, magmom and natom
+        atoms_xcart (list of ndarray)
+        selective (list of lists) - selective dynamics
+
+        magmom is appended with 0.6, please improve me! by using other values for magnetic elements 
+
+
+        if return_ins:
+            Returns Structure(), int - place of insertion of first atom
+        else:
+            Structure()
+       
+
+
+        """
+
+        printlog('self.add_atoms(): adding atom ', element, imp = 'n')
+
+        st = copy.deepcopy(self)
+
+        # print(st.select)
+        if selective: 
+            if not hasattr(st, 'select') or st.select is None or len(st.select) == 0:
+                st = st.selective_all()
+        # print(st.select)
+        # sys.exit()
+
+        natom_to_add = len(atoms_xcart)
+
+        st.natom+=natom_to_add
+
+        el_z_to_add = element_name_inv(element)
+
+        if hasattr(st, 'magmom') and any(st.magmom):
+            magmom_flag = True
+        else:
+            magmom_flag = False
+
+
+        if el_z_to_add not in st.znucl:
+            
+            st.znucl.append( el_z_to_add )
+            
+            st.nznucl.append(natom_to_add)            
+
+            st.ntypat+=1
+
+            typ = max(st.typat)+1
+        
+            st.xcart.extend(atoms_xcart)
+            
+            st.typat.extend( [typ]*natom_to_add )
+
+            if selective is not None:
+                st.select.extend(selective)
+            elif hasattr(st, 'select') and st.select and len(st.select) > 0:
+                # printlog('adding default selective', imp = 'y')
+
+                st.select.extend( [[True,True,True] for i in range(natom_to_add)] )
+            else:
+                ''
+
+            if magmom_flag:
+                st.magmom.extend( [0.6]*natom_to_add  )
+
+            j_ins = self.natom # first one
+
+        else:
+            i = st.znucl.index(el_z_to_add)
+            
+            st.nznucl[i]+=natom_to_add
+            
+            typ = i+1
+
+
+            for j, t in enumerate(st.typat):
+                if t == typ:
+                    j_ins = j+1 # place to insert
+
+
+
+
+            st.xcart[j_ins:j_ins] = atoms_xcart
+            
+            st.typat[j_ins:j_ins] = [typ]*natom_to_add
+
+            # print(st.select)
+            # sys.exit()
+            if selective is not None:
+                printlog('adding selective', imp = '')
+
+                st.select[j_ins:j_ins] = selective
+            elif hasattr(st, 'select') and  st.select and len(st.select) > 0:
+                printlog('adding default selective', imp = '')
+                st.select[j_ins:j_ins] = [[True,True,True] for i in range(natom_to_add)]
+            else:
+                ''
+
+            if magmom_flag:
+                st.magmom[j_ins:j_ins] =  [0.6]*natom_to_add
+
+
+        st.xcart2xred()
+        
+
+
+        # print(st.select)
+
+
+
+        if return_ins:
+            return st, j_ins
+        else:
+            return st
+
+
+    def add_atom(self, xr = None, element = 'Pu', xc = None, selective = None):
+        """
+        wrapper 
+        allows to add one atom using reduced coordinates or cartesian
+        """
+
+        if xr is not None:
+            ''
+            xc = xred2xcart([xr], self.rprimd)[0]
+        
+        elif xc is not None:
+            ''
+
+        else:
+            ''
+            printlog('Error! Provide reduced *xr* or cartesian *xc* coordinates!')
+
+
+        if selective is not None:
+            selective = [selective]
+
+        st = self.add_atoms([xc], element = element, selective = selective)
+        return st 
+
+    def reorder_for_vasp(self, inplace = False):
+        """
+        
+        Group and order atoms by atom types; consistent with VASP
+        return st
+        """
+        ''
+        if inplace:
+            st = self
+        else:
+            st = copy.deepcopy(self)
+        nt = range(st.ntypat)
+        zxred  = [[] for i in nt]
+        zxcart = [[] for i in nt]
+        ztypat = [[] for i in nt]
+        zmagmom= [[] for i in nt]
+        ziat =   [[] for i in nt]
+        i = 0
+        # print(st.ntypat)
+        for t, xr, xc in zip(st.typat, st.xred, st.xcart):
+            # print ("t ", t, xr)
+            zxred[ t-1].append(xr)
+            zxcart[t-1].append(xc)
+            ztypat[t-1].append(t)
+            ziat[t-1].append(i)
+            i+=1
+
+        st.nznucl = [len(typat) for typat in ztypat]
+
+        st.xcart = [item for sublist in zxcart for item in sublist]
+        st.xred  = [item for sublist in zxred for item in sublist]
+        st.typat = [item for sublist in ztypat for item in sublist]
+        original_numbers  = [item for sublist in ziat for item in sublist]
+        
+        st.perm = [original_numbers.index(i) for i in range(st.natom)] # show the initial order of atoms; starting from 0
+
+        if hasattr(st, 'magmom') and any(st.magmom):
+            for t, m in zip(st.typat, st.magmom):
+                zmagmom[t-1].append(m)
+            st.magmom = [item for sublist in zmagmom for item in sublist]
+
+        else:
+            st.magmom = [None]
+
+        # print(st.get_elements())
+
+        # print(st.perm)
+
+        
+
+        return st
+
+
+    def reorder_element_groups(self, order = None, inplace = False):
+        """
+        
+        Group and order atoms by atom types; consistent with VASP
+        order (list) -required order e.g. ['O', 'Li']
+
+        return st
+        """
+
+        st = copy.deepcopy(self)
+
+        # for z in st.znucl:
+        #     print(z)
+        
+        typat = []
+        xcart = []
+        magmom = []
+        znucl = []
+        # st.write_poscar()
+
+
+        els = st.get_elements()
+        t = 1
+        for el in order:
+            if el not in els:
+                printlog('Error! Check *order* list')
+            
+            znucl.append( invert(el) )
+
+            for i in range(st.natom):
+                el_i = els[i]
+                if el_i not in order:
+                    printlog('Error! Check *order* list')
+
+                if el_i == el:
+                    # print(el)
+                    typat.append(t)
+                    xcart.append(st.xcart[i])
+                    magmom.append(st.magmom[i])
+            t+=1
+
+        st.xcart = xcart
+        st.magmom = magmom
+        st.typat = typat
+        st.znucl = znucl
+        st.update_xred()
+        st.name+='_r'
+        # st.write_poscar()
+
+        return st
+
+
+    def del_atom(self, iat):
+        """
+        Now can delete only one atom with number iat (int), starting from 0. 
+        Takes care of magmom, ntypat, typat, znucl, nznucl, xred and natom
+        Returns Structure()
+        """
+
+
+        # print_and_log('Warning! Method del_atoms() was not carefully tested ')
+        st = copy.deepcopy(self)
+        # print(st.nznucl)
+
+        i = iat
+
+        typ = st.typat[i]
+
+        printlog('del_atom(): I remove atom ',  st.get_elements()[i], imp = 'n')
+        del st.typat[i]
+        del st.xred[i]
+        del st.xcart[i]
+
+        # print ('Magmom deleted?')
+        # print(st.magmom)
+        if hasattr(st, 'magmom') and any(st.magmom):
+            del st.magmom[i]
+            # print ('Yes!')
+        else:
+            ''
+            # print ('No!')
+
+
+
+        st.natom-=1
+
+        if typ in st.typat:
+            st.nznucl[typ-1]-=1
+        else:
+            del st.nznucl[typ-1]
+            del st.znucl[typ-1]
+            st.ntypat-=1
+
+            # for i, n in enumerate(st.nznucl):
+            #     typ = i+1
+            #     st.typat = [typ, ]
+
+            for i, t in enumerate(st.typat):
+                if t > typ:
+                    st.typat[i]-=1
+
+
+        # print(st.nznucl)
+
+        return st
+
+
+
+
+
+
+
+    def mov_atoms(self, iat = None, to_x = None, relative = False):
+        """
+        Move one atom to xcart position *to_x*
+        relative (bool) - if shift is relative
+
+        """
+        st = copy.deepcopy(self)
+        
+        if relative:
+            st.xcart[iat] += to_x
+        else:
+            st.xcart[iat] = to_x
+        
+
+        st.xcart2xred()
+
+        return st
+
+    def swap_atoms(self, iat1, iat2):
+        st = copy.deepcopy(self)
+        x1 = st.xcart[iat1]
+        st.xcart[iat1] = st.xcart[iat2]
+        st.xcart[iat2] = x1
+        st.xcart2xred()
+        return st
+
+
+    def leave_only(self, atom_type = None):
+        #Remove all atoms except *atom_type*(str, mendeleev element name)
+        print_and_log('Starting leave_only()', imp = 'n')
+
+        st = copy.deepcopy(self)
+        
+        print_and_log('    N of atoms before = ',st.natom, imp = 'n')
+
+
+        z = element_name_inv(atom_type)
+
+        new_xred = []
+        new_magmom = []
+        
+        if hasattr(st, 'magmom') and any(st.magmom):
+            for t, xr, m in zip(st.typat, st.xred, st.magmom):
+                if st.znucl[t-1] == z:
+                    new_xred.append(xr)
+                    new_magmom.append(m)
+        else:
+            for t, xr in zip(st.typat, st.xred):
+                if st.znucl[t-1] == z:
+                    new_xred.append(xr)
+
+
+        st.magmom = new_magmom
+
+        st.xred = new_xred
+
+        st.natom = len(new_xred)
+
+        st.ntypat = 1
+
+        st.typat = [1]*st.natom
+
+        st.znucl = [z,]
+
+        st.nznucl = [st.natom,]
+
+        st.xcart = xred2xcart(st.xred, st.rprimd)
+
+        # print st.xred
+
+        print_and_log('    N of atoms after  = ',st.natom, imp = 'n')
+
+
+        return st
+
+
+    def get_numbers(self, element):
+        "return numbers of specific element "
+        return [i for i, el in enumerate(self.get_elements()) if el == element]
+
+
+    def remove_atoms(self, atoms_to_remove, from_one = 0):
+        """
+        remove atoms either of types provided in *atoms_to_remove* or having numbers provided in *atoms_to_remove*, starting from 0
+        st (Structure)
+        atoms_to_remove (list) - list of element names or numbers
+        from_one (int)- if 1 the numbers of atoms in provided list are starting from one
+        """
+        st = copy.deepcopy(self)
+        # print(st.nznucl)
+
+        numbers = list(range(st.natom))
+
+
+        atom_exsist = True
+
+        while atom_exsist:
+
+            for i, (n, el) in enumerate(  zip(numbers, st.get_elements()) ):
+                # print(i)
+
+                if el in atoms_to_remove or n+from_one in atoms_to_remove:
+                    # print(n)
+                    # atoms_to_remove.remove(i)
+                    st = st.del_atom(i)
+                    del numbers[i]
+
+                    break
+            else:
+                atom_exsist = False
+        printlog('remove_atoms(): Atoms', atoms_to_remove, 'were removed')
+        st.magmom = [None]
+
+        # print(st.nznucl)
+
+        # print(st.get_elements())
+        return st
+
+
+    def del_layers(self, xred_range,):
+        """
+        fix atoms in layers normal to R3
+
+        xred_range (list) [from, to]
+        highlight - replace with Pu to check
+
+        """
+        st = copy.deepcopy(self)
+        # print(st.nznucl)
+
+        dels = []
+        for i, xr in enumerate(st.xred):
+            if xred_range[0]  < xr[2] < xred_range[1]:
+                # print(xred_range[0], xr[2], xred_range[1])
+                dels.append(i)
+        # print(dels)
+        st = st.remove_atoms(dels)
+        st.name+='_del'
+        # print(st.nznucl)
+        
+        return st
+
+
+
+
+
+
+    def replace_atoms(self, atoms_to_replace, el_new):
+        """
+        atoms_to_replace - list of atom numbers starting from 0
+        el_new - new element
+        """
+        st = copy.deepcopy(self)
+
+        numbers = list(range(st.natom))
+
+
+        atom_exsist = True
+
+        while atom_exsist:
+
+
+            for i, (n, el) in enumerate(  zip(numbers, st.get_elements()) ):
+                # print(i)
+
+                if n in atoms_to_replace:
+                    xcart = st.xcart[i]
+                    print('replace_atoms(): atom', i, st.get_elements()[i], 'replaced with', el_new)
+                    st = st.del_atom(i)
+
+                    st = st.add_atoms([xcart], element = el_new)
+                    # print(st.natom)
+                    # print(st.get_elements())
+
+                    # print(st.natom)
+
+                    # print(st.get_elements())
+                    del numbers[i]
+
+                    break
+            else:
+                atom_exsist = False
+        # printlog('remove_atoms(): Atoms', atoms_to_remove, 'were removed')
+
+        # print(st.get_elements())
+        return st
+
+
+
+
+
+    def remove_part(self, element, new_conc):
+        """
+        element to remove
+        new_conc <1 - new concentration of element atoms (part of unity)
+        """
+        st = copy.deepcopy(self)
+
+
+        numb = self.get_numbers(element)
+
+        nat_el = int(np.ceil((len(numb)*new_conc)))
+        printlog('New number of ', element, 'atoms is ', nat_el, imp = 'y')
+
+        del_num = numb[nat_el:len(numb)]
+
+
+
+        return st.remove_atoms(del_num)
+
+
+
+
+    def add_vacuum(self, vec, thick):
+        """
+        To be improved
+        vector - along which vector, 0, 1, 2
+        thick - thickness of vector 
+
+
+        TODO:
+        make thick to be thickness along axis and not vector
+
+        """
+        st = copy.deepcopy(self)
+        v = st.rprimd[vec]
+        v_l = np.linalg.norm(v)
+        new_len = v_l+thick
+
+        st.rprimd[vec]*=new_len/v_l
+
+        st.update_xred()
+        st.name+='_vac'
+        # st.write_xyz()
+        return st
+
+
+
+
+
+    # def sum_of_coord(self):
+    #     sumx = 0
+    #     for x in self.xcart:
+    #         sumx+=x
+    #     sumx/=len(self.xcart)
+    #     return sumx
+
+    def return_atoms_to_cell(self):
+
+
+        st = copy.deepcopy(self)
+        bob = 0; upb = 1;
+        n = 0 
+        # print st.xred
+        for xr in st.xred:
+            for j in 0,1,2:
+                if xr[j]  < bob:  xr[j] = xr[j] - int(xr[j]) + 1 #allows to account that xr can be more than 2
+                if xr[j]  >= upb:  xr[j] = xr[j] - int(xr[j])
+        n+=1
+        # zmin = 100
+        # for xr in st.xred:
+        #     if xr[2]<zmin: zmin = xr[2]
+        # if zmin < 0:
+        #     for xr in st.xred:
+        #         xr[2] = xr[2]-zmin
+
+
+
+        st.xcart = xred2xcart(st.xred, st.rprimd)
+
+        print_and_log(str(n)+" atoms were returned to cell.\n")
+        #print st.xred
+        return st
+
+
+
+    def find_atom_num_by_xcart(self, x_tar, prec = 1e-6):
+        """take into account periodic conditions
+
+        TODO:
+        make normal function that treats periodic boundary conditions normally!!!
+        """
+
+        [xr_tar] = xcart2xred([x_tar], self.rprimd)
+        printlog('find_atom_num_by_xcart(): xr_tar = ', xr_tar)
+        #PBC!!!
+        for i in [0,1,2]:
+            if xr_tar[i] < 0:
+                xr_tar[i]+= 1
+                
+            if xr_tar[i] >= 1:
+                xr_tar[i]-= 1
+        printlog('find_atom_num_by_xcart(): xr_tar after periodic = ', xr_tar)
+
+        # print(xr_tar)
+        [x_tar] = xred2xcart([xr_tar], self.rprimd)
+        
+        printlog('find_atom_num_by_xcart(): x_tar after periodic = ', x_tar)
+
+        # print(x_tar)
+        self = self.return_atoms_to_cell()
+
+        for i, x in enumerate(self.xcart):
+            if np.linalg.norm(x-x_tar) < prec:
+            # if all(x == x_tar):
+                printlog('Atom', i+1, 'corresponds to', x_tar)
+
+                return i
+        else:
+            printlog('Attention, atom ', x_tar, 'was not found' )
+        # print self.xcart.index(x_tar)
+        # return self.xcart.index(x_tar)
+
+
+        # print type(atoms_xcart)
+
+
+
+    def shift_atoms(self, vector_red):
+        """
+        Shift all atoms according to *vector_red*
+        """
+        st = copy.deepcopy(self)
+        vec = np.array(vector_red)
+        for xr in st.xred:
+            xr+=vec
+
+        st.xred2xcart()
+        st = st.return_atoms_to_cell()
+        return st
+
+
+
+    def replic(self, *args, **kwargs):
+
+        return replic(self, *args, **kwargs)
+
+    def image_distance(self, *args, **kwargs):
+
+        return image_distance(*args, **kwargs)
+
+
+
+    def remove_close_lying(self, rm_both = 0, rm_first = 0):
+        """
+        rm_both (bool) - if True than remove both atoms, if False than only the second atom is removed
+        rm_first (bool) - if True than the first atom of two overlapping is removed, otherwise the second atom is removed
+
+        PBC is realized through image_distance
+
+        SIDE:
+            write _removed field to returned st
+
+        TODO:
+            Works incorrectly for more than one overlap !!!
+
+
+        """
+        st = copy.deepcopy(self)    
+        tol = 0.4
+        removed = False
+        x1_del = []
+        x2_del = []
+        numbers = range(st.natom)
+        count = 0
+        for i, x1 in enumerate(st.xcart):
+            for j, x2 in list(zip(numbers, st.xcart))[i+1:]:
+                # print(i,j)
+                # if all(x1 == x2):
+                #     continue
+                # if all(x1 == x1_del) or (x2 == x2_del):
+                #     continue
+                if self.image_distance(x1, x2)[0] < tol:
+                    count+=1
+                    if count > 1:
+                        raise RuntimeError # for detecting multiple overlaps please make this function more universal - removing not by numbers, but by coordinates or more intelligent- see remove_atoms()
+                    x1_del = x1
+                    x2_del = x2
+                    if rm_both:
+                        printlog('remove_close_lying(): Atoms', i,j, 'of types ', st.get_elements()[i], st.get_elements()[j], 'are removed')
+
+                        st = st.remove_atoms([i, j])
+                        removed = True
+                    else:
+                        printlog('remove_close_lying(): Atom', j, 'of type ', st.get_elements()[j], 'is removed')
+                        
+                        if rm_first:
+                            st = st.remove_atoms([i]) # the existing atom is removed
+                        else:
+                            st = st.remove_atoms([j]) # the added atom is removed
+                        
+                        removed = True
+        st._removed = removed
+
+        return st, x1_del, x2_del
+
+    def nn(self, i, n = 6, ndict = None, only = None, silent = 0, from_one = True, more_info = 0):
+        """
+        show neigbours
+        i - number of central atom, from 1 or 0 (from_one = True or False)
+        ndict (dic) - number of specific neigbour atoms
+        only - list of interesting z neighbours
+
+        more_info - return more output - takes time
+
+        out
+            'numbers' from 0 in the new version!!!!!
+        """
+        import itertools
+        from functions import invert
+        if from_one:
+            i -= 1
+
+        zn = self.znucl
+        x = self.xcart[i]
+        out_or = local_surrounding(x, self, n, 'atoms', True, only_elements = only)
+        # out =  (xcart_local, typat_local, numbers, dlist )
+
+        out = list(out_or)
+        # out[0] = list(itertools.chain.from_iterable(out[0]))
+        out[1] = [invert(zn[o-1]) for o in out[1]]
+        out[2] = [o+1 for o in out[2]]
+
+        out_tab = [range(0, len(out[2])), out[2], out[1], out[3]]
+
+        tab = np.asarray(out_tab).T.tolist()
+
+ 
+        # df = pd.DataFrame(tab)
+        # print(df)
+        if not silent:
+            print('Neighbors around atom', i+1, self.get_elements()[i],':')
+            print( tabulate(tab[1:], headers = ['nn', 'No.', 'El', 'Dist, A'], tablefmt='psql', floatfmt=".2f") )
+
+
+        info = {}
+        info['numbers'] = out_or[2]
+
+
+        el = self.get_elements()
+        info['el'] = [el[i] for i in out_or[2]]
+        info['av(A-O,F)'] = local_surrounding(x, self, n, 'av', True, only_elements = [8,9], round_flag = 0)
+        
+        if more_info:
+            info['avsq(A-O,F)'] = local_surrounding(x, self, n, 'avsq', True, only_elements = [8,9])
+            info['avdev(A-O,F)'], _   = local_surrounding(x, self, n, 'av_dev', True, only_elements = [8, 9])
+            info['sum(A-O,F)'] = local_surrounding(x, self, n, 'sum', True, only_elements = [8,9])
+
+        t = set(out_or[2])
+        s = set(range(self.natom)) 
+        d = s.difference(t) 
+        # d = d.remove(i)
+        # print(t)
+        # print(i)
+        # print(d)
+        st_left = self.remove_atoms(d)
+        st_left.name+='_loc'
+        # sys.exit()
+        st_left.dlist = out_or[3] # distances to neighbours
+        st_left.ellist = info['el'] # types of neighbours
+        info['st'] = st_left
+
+        if ndict:
+            info['av(A-O)']   = local_surrounding(x, self, ndict[8], 'av', True, only_elements = [8])
+            info['avdev(A-O)'], _   = local_surrounding(x, self, ndict[8], 'av_dev', True, only_elements = [8])
+            info['min(A-O)'], _ ,info['max(A-O)']    = local_surrounding(x, self, ndict[8], 'mavm', True, only_elements = [8])
+            atoms = local_surrounding(x, self, ndict[8], 'atoms', True, only_elements = [8])
+            info['Onumbers'] = atoms[2][1:] # exclude first, because itself!
+            # print(info['Onumbers'])
+
+        # print(info)
+
+        return info
+
+
+    def center(self):
+        #return cartesian center of the cell
+        return np.sum(self.xcart, 0)/self.natom
+
+    def center_on(self, i):
+        #calc vector which alows to make particular atom in the center 
+        x_r = self.xred[i]
+        center = np.sum(self.xred, 0)/self.natom
+        # print(center)
+        # sys.exit()
+        # print(x_r)
+        dv = center - x_r
+        # print(dv)
+        # print(dv+x_r)
+        return dv
+
+
+    def write_poscar(self, filename = None, coord_type = 'dir', vasp5 = True, charges = False, energy = None, selective_dynamics = False):
+        """
+        write 
+
+        charges (bool) - write charges, self.charges should be available
+        energy - write total energy
+
+        selective dynamics - 
+            if at least one F is found than automatically switched on
+            !works only for coord_type = 'dir' and charges = False
+
+
+        TODO
+            selective_dynamics for coord_type = 'cart'
+        """
+
+        def b2s(b):
+            #bool to vasp str
+            if b:
+                s = 'T'
+            else:
+                s = 'F'
+
+            return s
+
+
+        st = self
+        to_ang = 1
+        rprimd = st.rprimd
+        xred   = st.xred
+        xcart  = st.xcart
+        typat = st.typat  
+        znucl = st.znucl
+        els   = st.get_elements()
+
+        # print(st.convert2pymatgen())
+
+        # print()
+        try:
+            select = st.select
+        except:
+            st = st.selective_all()
+            select = st.select
+
+        # print(select)
+
+        if selective_dynamics is False:
+            selective_dynamics = st.check_selective()
+
+        # print(selective_dynamics)
+
+
+        if not filename:
+            filename = ('xyz/POSCAR_'+st.name).replace('.', '_')
+
+        makedir(filename)
+
+        printlog('Starting writing POSCAR', filename, 'Vasp5:', vasp5)
+
+        # print 
+        """1. Generate correct nznucl and zxred and zxcart"""
+        zxred  = [[] for i in znucl]
+        zxcart = [[] for i in znucl]
+        zchar = [[] for i in znucl]
+        zelem = [[] for i in znucl]
+        zselect = [[] for i in znucl]
+        # nznucl = []
+        if len(typat) != len(xred) or len(xred) != len(xcart):
+            raise RuntimeError
+        
+
+        # print(xred)
+        # print(typat)
+
+        for t, xr, xc, el in zip(typat, xred, xcart, els ):
+            # print ("t ", t-1, xr)
+            zxred[ t-1].append(xr)
+            zxcart[t-1].append(xc)
+            zelem[t-1].append(el)
+        
+        if selective_dynamics:
+            for t, s in zip(typat, select):
+                zselect[t-1].append(s)
+
+        # print(zselect)
+        # print(zxred)
+
+
+        # print(charges)
+        if charges:
+            charg = self.charges
+
+            for t, ch in zip(typat, charg):
+                zchar[t-1].append(ch)
+
+
+
+
+        nznucl = [len(xred) for xred in zxred]
+        # print(nznucl)
+        # sys.exit()
+
+        elnames = [element_name_inv(z) for z in znucl]
+
+
+
+        with open(filename,'w', newline = '') as f:
+            """Writes structure (POSCAR) in VASP format """
+            if energy:
+                energy_string = 'e0='+str(energy)+' ; '
+            else:
+                energy_string = ''
+
+            f.write('i2a=['+list2string(elnames).replace(' ', ',') + '] ; '+energy_string)
+            
+            if hasattr(self, 'tmap'):
+                f.write('tmap=[{:s}] ; '.format(list2string(st.tmap).replace(' ', ',') ))
+
+
+            f.write(self.name)
+
+
+            f.write("\n{:18.15f}\n".format(1.0))
+            
+            for i in 0, 1, 2:
+                f.write('{:10.6f} {:10.6f} {:10.6f}'.format(rprimd[i][0]*to_ang,rprimd[i][1]*to_ang,rprimd[i][2]*to_ang) )
+                f.write("\n")
+
+            if vasp5:
+                for el in elnames:
+                    f.write(el+' ')
+                f.write('\n')
+
+
+            for n in nznucl:    
+                f.write(str(n)+' ')
+                # print(str(n)+' ')
+            f.write('\n')
+
+            if selective_dynamics:
+                f.write("Selective dynamics\n")
+
+
+
+            if "car" in coord_type:
+                print_and_log("Warning! may be obsolete!!! and incorrect", imp = 'Y')
+                f.write("Cartesian\n")
+                for xcart in zxcart:
+                    for x in xcart:
+                        f.write(str(x[0]*to_ang)+" "+str(x[1]*to_ang)+" "+str(x[2]*to_ang))
+                        f.write("\n")
+
+                
+                if hasattr(self.init, 'vel'):
+                    print_and_log("I write to POSCAR velocity as well")
+                    f.write("Cartesian\n")
+                    for v in self.init.vel:
+                        f.write( '  {:18.16f}  {:18.16f}  {:18.16f}\n'.format(v[0]*to_ang, v[1]*to_ang, v[2]*to_ang) )
+
+            elif "dir" in coord_type:
+                f.write("Direct\n")
+                
+                if charges:
+                    for xred, elem, char in zip(zxred, zelem, zchar, ):
+                        for x, el, ch in zip(xred, elem, char):
+                            f.write("  {:12.10f}  {:12.10f}  {:12.10f}  {:2s}  {:6.3f}\n".format(x[0], x[1], x[2], el, ch) )
+                elif selective_dynamics:
+                    for xred, select in zip(zxred, zselect):
+                        for x, s in zip(xred, select):
+                            # print(x,s)
+                            f.write("  {:19.16f}  {:19.16f}  {:19.16f}  {:s} {:s} {:s}\n".format(x[0], x[1], x[2], b2s(s[0]), b2s(s[1]), b2s(s[2])) )
+                else:
+                    for xred  in zxred :
+                        for x in xred :
+                            f.write("  {:19.16f}  {:19.16f}  {:19.16f}\n".format(x[0], x[1], x[2]))
+
+            
+
+
+            elif 'None' in coord_type:
+                pass
+
+            else:
+                print_and_log("Error! The type of coordinates should be 'car' or 'dir' ")
+                raise NameError
+        
+
+        f.close()
+        print_and_log("POSCAR was written to", filename, imp = 'y')
+        return
+
+
+
+    def write_cif(self, filename = None, mcif = False):
+        """
+        Find primitive cell and write it in cif format
+        
+
+        mcif (bool) - if True, than write mcif file with magnetic moments included, primitive cell is not supported
+
+
+        
+
+        """
+        
+        if mcif:
+            m = 'm'
+        else:
+            m = ''
+
+        if filename == None:
+            filename = 'cif/'+self.name
+
+
+        makedir(filename)
+        symprec = 0.1
+        st_mp = self.convert2pymatgen()
+
+        # print(st_mp)
+
+        try:
+            sg_before =  st_mp.get_space_group_info() 
+
+
+            sf = SpacegroupAnalyzer(st_mp, symprec = symprec)
+
+            st_mp_prim = sf.find_primitive()
+
+            sg_after = st_mp_prim.get_space_group_info()
+
+        except:
+            sg_before = [None]
+            sg_after = [None]
+
+        if sg_before[0] != sg_after[0]:
+            printlog('Attention! the space group was changed after primitive cell searching', sg_before, sg_after)
+            printlog('I will save supercell in cif and reduce symprec to 0.01')
+            st_mp_prim = st_mp
+            symprec = 0.01
+
+        if mcif:
+            cif = CifWriter(st_mp, symprec = symprec, write_magmoms=mcif)
+        else:
+            # cif = CifWriter(st_mp_prim, symprec = symprec, write_magmoms=mcif)
+            cif = CifWriter(st_mp, symprec = symprec, write_magmoms=mcif)
+        
+        cif_name =  filename+'.'+m+'cif'
+        
+        cif.write_file( cif_name  )
+        printlog('Writing cif', cif_name, imp = 'y')
+
+
+    def write_xyz(self, *args, **kwargs):
+        #see description for write_xyz()
+        return write_xyz(self, *args, **kwargs)
+
+
+
+    def write_lammps(self, *args, **kwargs):
+        return write_lammps(self, *args, **kwargs)
+
+
+    def read_xyz(self, *args, **kwargs):
+        
+        # print(self.perm)
+        return read_xyz(self, *args, **kwargs)
+
+
+    def jmol(self, shift = None):
+        # self.write_poscar('CONTCAR', vasp5 = 1)
+        st = self
+        if shift:
+            st = st.shift_atoms(shift)
+
+
+        filename, _ = st.write_xyz()
+        # print(filename)
+        runBash('jmol '+filename, detached = True)
+        return
+
+class Calculation(object):
+    """Main class of siman. Objects of this class contain all information about first-principles calculation
+        List of important fields:
+            - init (Structure)
+            - end  (Structure)
+            - occ_matrices (dict) - occupation matrices, number of atom (starting from 0) is used as key
+
+
+    """
+    def __init__(self, inset = None, iid = None, output = None):
         #super(CalculationAbinit, self).__init__()
         self.name = "noname"
         self.set = copy.deepcopy(inset)
+        
+        # if self.set.set_sequence:
+
+
+
+        self.init = Structure()
         self.end = Structure()
-        self.state = "1.Initialized"
+        self.state = "0.Initialized"
         self.path = {
         "input":None,
         "input_geo":None,
         "potential":None,
-        "output":None}
+        "output":output}
+        self.calc_method = None #
+        self.prev = [] # list of previous calculations
+        if iid:
+            self.id = iid
+            self.name = str(iid[0])+'.'+str(iid[1])+'.'+str(iid[2])
+        else:
+            self.id = ('0','0',0)
+    
+    def get_path(self,):
+        print( os.path.dirname(os.getcwd()+'/'+self.path['output']))
 
 
-
-
-
-    def read_geometry(self,filename = None):
+    def read_geometry(self, filename = None):
         """Reads geometrical data from filename file in abinit format"""
         if self.path["input_geo"] == None:
             self.path["input_geo"] = filename
@@ -231,11 +1918,12 @@ class Calculation():
             self.des = '';  
             for line in memfile.splitlines():
                 if 'des' in line: 
-                    print line; self.des = line.split('des ')[1]+';'
+                    # print line; 
+                    self.des = line.split('des ')[1]+';'
                 
                 self.build = empty_struct()                
                 if 'BEGIN BUILD INFORMATION' in line:
-                    print "\nFile contain build information! Start to read"
+                    print_and_log("File contain build information! Start to read", imp = 'n')
                     # self.build = Structure()
                     # # self.build.rprimd = None
                     # # self.build.xred = None
@@ -260,29 +1948,31 @@ class Calculation():
                     self.build.nadded = read_list("nadded", 1, int, gen_words)[0] #total number of added atoms after building structure
                     self.build.listadded = read_list("listadded", self.build.nadded, int, gen_words) #list of added atoms corresponding to xred 
 
-                    print "Build information has been read\n"
+                    print_and_log("Build information has been read")
 
 
 
 
+            self.init = Structure()
 
             #sys.exit()
             self.useable = 0
             #Read total number of atoms
-            #Programm nznucl, since We will have more impurity atoms of different types
-            command="""grep -w -m 1 "natom " """+filename
-            s1=runBash(command)
+#             #Programm nznucl, since We will have more impurity atoms of different types
+#             command="""grep -w -m 1 "natom " """+filename
+#             s1=runBash(command)
+            self.natom = read_list("natom", 1, int, gen_words)[0]
             # print command
             # print s1
-            self.natom_str = s1
-            if s1=='':
-                self.natom = 0
-                print_and_log( """Warning! In filename """+filename+""" not found natom! set to zero.
-                It is very likly that other parameters was not 
-                found too, Calculation completly not useable!!!""")
-                raise RuntimeError
-            else:
-                self.natom=int(s1.split()[1]) 
+#             self.natom_str = s1
+#             if s1=='':
+#                 self.natom = 0
+#                 print_and_log( """Warning! In filename """+filename+""" not found natom! set to zero.
+#                 It is very likely that other parameters was not 
+#                 found too, Calculation completely unusable!!!""")
+#                 raise RuntimeError
+#             else:
+#                 self.natom=int(s1.split()[1]) 
 
             self.acell = read_list("acell", 3, float, gen_words)
             self.rprim = read_vectors("rprim", 3, gen_words)
@@ -290,20 +1980,20 @@ class Calculation():
             self.rprimd = copy.deepcopy( self.rprim )
             for i in 0,1,2:
                 self.rprimd[i] = self.rprim[i] * self.acell[i]         #Calculate rprimd
-            #Determine reciprocal vectors
-            self.recip = []
+            
             self.vol = np.dot( self.rprimd[0], np.cross(self.rprimd[1], self.rprimd[2])  ); #volume
-            #print vol
-            self.recip.append(   np.cross( self.rprimd[1], self.rprimd[2] )   )
-            self.recip.append(   np.cross( self.rprimd[2], self.rprimd[0] )   )
-            self.recip.append(   np.cross( self.rprimd[0], self.rprimd[1] )   )
-            for i in 0,1,2:
-                self.recip[i] =  self.recip[i] * 2 * math.pi / self.vol;
-            #print self.recip
+                      
+            self.recip = calc_recip_vectors(self.rprimd) #Determine reciprocal vectors
+
 
             self.ntypat = read_list("ntypat", 1, int, gen_words)[0]
             self.typat = read_list("typat", self.natom, int, gen_words)
+            if 0 in self.typat:
+                print_and_log('Error; 0 in typat is not allowed')
+                raise RuntimeError
+
             self.nznucl = []
+
             for typ in range(1,self.ntypat+1):
                 self.nznucl.append(  self.typat.count(typ) )
 
@@ -315,11 +2005,11 @@ class Calculation():
             #print self.xred
             
             if self.xred == [None]:
-                print "Convert xcart to xred"
+                print_and_log("Convert xcart to xred")
                 self.xred = xcart2xred(self.xcart, self.rprimd)
             
             if self.xcart == [None]:
-                print "Convert xred to xcart"
+                print_and_log("Convert xred to xcart")
                 self.xcart = xred2xcart(self.xred, self.rprimd)
 
             self.hex_a = read_list("hex_a", 1, float, gen_words)[0]
@@ -332,7 +2022,9 @@ class Calculation():
 
 
 
-            self.init = Structure()
+            self.init.hex_a = self.hex_a
+            self.init.hex_c = self.hex_c
+            self.init.gbpos = self.gbpos
             self.init.name = self.name+'.init'
             self.init.xcart = self.xcart 
             self.init.xred = self.xred
@@ -349,10 +2041,14 @@ class Calculation():
 
             vel = read_vectors("vel", self.natom, gen_words)
             # print vel
-            if vel[0] != None: self.init.vel = vel
+            if vel[0] != None: 
+                self.init.vel = vel
 
             #read magnetic states; name of vasp variable
-            self.init.magmom = read_list("magmom", self.natom, float, gen_words)
+            curset = self.set
+            if hasattr(curset, 'magnetic_moments') and curset.magnetic_moments:
+                self.init.magmom = read_list("magmom", self.natom, float, gen_words)
+            # self.init.mag_moments 
 
 
 
@@ -360,7 +2056,7 @@ class Calculation():
 
 
 
-            self.state = "2.Geometry has been read"
+            self.state = "1.Geometry has been read"
 
 
 
@@ -371,137 +2067,24 @@ class Calculation():
         return
 
 
-    def read_poscar(self, filename):
-        """Read POSCAR file
-        """
-        if self.path["input_geo"] == None:
-            self.path["input_geo"] = filename
-        self.len_units = 'Angstrom'
-        self.hex_a = None
-        self.hex_c = None
-        self.gbpos = None
-
-
-        #Determine version
-        self.version = None
-        # try:
-        print filename.split('-')[-1], 'in read_poscar'
-        self.version = int(filename.split('-')[-1] )
-        # except:
-        #     pass
-        print self.version, 'version'
-
-
-
-        self.init = Structure()
-        st = self.init
-        with open(filename,'r') as f:
-            name = f.readline().strip()
-            # print self.name, "self.name"
-
-            self.des = name
-            # st.name = self.name
-
-            mul = float( f.readline() )
-            print 'mul', mul
-
-
-            st.rprimd = []
-            for i in 0, 1, 2:
-                vec = f.readline().split()
-                st.rprimd.append( np.asarray([float(vec[0])*mul, float(vec[1])*mul, float(vec[2])*mul]) )
-
-            st.nznucl = []
-            for z in f.readline().split():
-                st.nznucl.append( int(z)  )
-
-            type_of_coordinates = f.readline()
-
-            st.xred = []
-
-
-            if "Car" in type_of_coordinates:
-                # print "Warning! may be obsolete!!! and incorrect"
-                # f.write("Cartesian\n")
-                # for xcart in zxcart:
-                #     for x in xcart:
-                #         f.write(str(x[0]*to_ang)+" "+str(x[1]*to_ang)+" "+str(x[2]*to_ang))
-                #         f.write("\n")
-                raise RuntimeError
-                
-            elif "dir" in type_of_coordinates or 'Dir' in type_of_coordinates:
-                for nz in st.nznucl:
-                    for i in range(nz):
-                        vec = f.readline().split()
-                        st.xred.append( np.asarray([float(vec[0]), float(vec[1]), float(vec[2])]) )
-                st.xcart = xred2xcart(st.xred, st.rprimd)
-
-            elif 'None' in type_of_coordinates:
-                pass
-
-            else:
-                print_and_log("Error! The type of coordinates should be 'car' or 'dir' ")
-                raise NameError
-
-
-            print '!Name should contain names of elements; Name is ', name.split('!'), 'you could use ! to add comment after name'
-
-            st.znucl = []
-            for elname in name.split('!')[0].strip().split():
-                st.znucl.append( element_name_inv(elname) )
-
-            st.natom = len(st.xred)
-
-            st.ntypat = len(st.znucl)
-
-            st.typat = []
-            for i, nz in enumerate(st.nznucl):
-                for j in range(nz):
-                    st.typat.append(i+1)
-
-            #Determine reciprocal vectors
-            st.recip = []
-            st.vol = np.dot( st.rprimd[0], np.cross(st.rprimd[1], st.rprimd[2])  ); #volume
-            #print vol
-            st.recip.append(   np.cross( st.rprimd[1], st.rprimd[2] )   )
-            st.recip.append(   np.cross( st.rprimd[2], st.rprimd[0] )   )
-            st.recip.append(   np.cross( st.rprimd[0], st.rprimd[1] )   )
-            for i in 0,1,2:
-                st.recip[i] =  st.recip[i] * 2 * math.pi / st.vol;
-
-
-
-
-
-
-                # if hasattr(self.init, 'vel'):
-                #     print "I write to POSCAR velocity as well"
-                #     f.write("Cartesian\n")
-                #     for v in self.init.vel:
-                #         f.write( '%.12f %.12f %.12f\n'%(v[0]*to_ang, v[1]*to_ang, v[2]*to_ang) )
-
-        print self.init.znucl, 'self.init'
-
-
-        print_and_log( "POSCAR was read\n")
-        return
 
 
 
     def write_geometry(self, geotype = "init", description = "", override = False):
-        """Writes geometrical data to self.path["input_geo"]"""
+        """Writes geometrical data in custom siman format bases on abinit format to self.path["input_geo"]"""
         geo_dic = {}
         geofile = self.path["input_geo"]
         geo_exists = os.path.exists(geofile)
-
+        # print (os.path.exists(geofile))
         if geo_exists:
             if override:
-                print_and_log("Warning! File "+geofile+" was replaced\n"); 
+                print_and_log("Warning! File "+geofile+" was replaced"); 
             else: 
-                print_and_log("Error! File "+geofile+" exists. To replace it set parameter override\n"); 
+                print_and_log("Error! File "+geofile+" exists. To replace it set parameter override"); 
                 return False
                 #raise RuntimeError
-        
+        # print "geofile name, classes:",  geofile
+        # print "folder :",  os.path.dirname(geofile)
         if not os.path.exists(os.path.dirname(geofile)):
             os.makedirs(os.path.dirname(geofile))
 
@@ -509,27 +2092,47 @@ class Calculation():
             st = self.init
         elif geotype == "end":
             st = self.end
-            if not hasattr(st, 'natom'):  st.natom = self.init.natom
-            if not hasattr(st, 'ntypat'): st.ntypat = self.init.ntypat
-            if not hasattr(st, 'typat'): st.typat = self.init.typat
-            if not hasattr(st, 'znucl'): st.znucl = self.init.znucl 
+            # if not hasattr(st, 'natom'):  st.natom = self.init.natom
+            # if not hasattr(st, 'ntypat'): st.ntypat = self.init.ntypat
+            # if not hasattr(st, 'typat'): st.typat = self.init.typat
+            # if not hasattr(st, 'znucl'): st.znucl = self.init.znucl 
         else: print_and_log("Error! Unknown geotype \n"); raise RuntimeError                                  
 
         if st.natom != len(st.xred) != len(st.xcart) != len(st.typat) or len(st.znucl) != max(st.typat): 
-            print "Error! write_geometry: check your arrays.\n\n" 
+            print_and_log("Error! write_geometry: check your arrays.", imp = 'Y')
+            raise RuntimeError
 
-
-
-        with open(self.path["input_geo"],"w") as f:
+        # print (st.magmom)
+        # sys.exit()
+        with open(self.path["input_geo"],"w", newline = '') as f:
             f.write("des "+description+"\n")
             f.write("len_units "+self.len_units+"\n")
-            f.write("hex_a "+str(self.hex_a)+"\n")
-            f.write("hex_c "+str(self.hex_c)+"\n")
-            try: self.gbpos
-            except AttributeError:
-                self.gbpos = None
-            f.write("gbpos "+str(self.gbpos)+"\n")
+            
+            if hasattr(st, 'hex_a'):
+                f.write("hex_a "+str(st.hex_a)+"\n")
+            if hasattr(st, 'hex_c'):
+                f.write("hex_c "+str(st.hex_c)+"\n")
+
+            # try: self.gbpos
+            # except AttributeError:
+            #     self.gbpos = None
+            if hasattr(st, 'gbpos'):
+                f.write("gbpos "+str(st.gbpos)+"\n")
+            
+
             f.write("version "+str(self.version)+"\n")
+            
+            try: 
+                st.magmom
+            except AttributeError:
+                st.magmom = [None]
+            # print st.magmom 
+            # sys.exit()
+            if not None in st.magmom:
+                f.write("magmom "+' '.join(np.array(st.magmom).astype(str)) +"\n")
+
+
+
             f.write("acell 1 1 1\n")
 
             f.write("natom  " +str(st.natom) +"\n")
@@ -589,7 +2192,49 @@ class Calculation():
         return True
 
 
+    def write_siman_geo(self, *args, **kwargs):
+        """
+        Please rename write_geometry() to write_abinit_geo() everywhere and transfer the code here
+        """
+        return self.write_geometry(*args, **kwargs)
 
+    def serialize(self, filename):
+        """
+        save as pickle object, return path
+        """
+        file = filename+'.pickle'
+        makedir(file)
+        with open(file, 'wb') as f:
+            pickle.dump(self, f, 2)
+        return file
+
+    def deserialize(self, filename):
+        with open(filename, 'rb') as f:
+            self = pickle.load(f)
+        # printlog('Calculation object succesfully read from ', filename)
+        return self
+
+
+    def get_kpoints_density(self):
+        """
+        Number of k-points per atom
+        """
+        print(self.NKPTS*self.end.natom) #KPPRA - k-points per reciprocal atom? 
+
+    def copy(self):
+        return copy.deepcopy(self)
+
+    def jmol(self):
+        self.end.jmol()
+    def poscar(self):
+        self.end.write_poscar()
+    def me(self):
+        self.end.printme()
+
+    @property
+    def sfolder(self):
+        self._x = header.struct_des[self.id[0]].sfolder
+        return self._x
 
 
 
@@ -605,36 +2250,307 @@ class CalculationAbinit(Calculation):
 
 
 
-
 class CalculationVasp(Calculation):
     """Methods for calculations made using VASP DFT code"""
+    def __init__(self, inset = None, iid = None, output = None):
+        super(CalculationVasp, self).__init__(inset, iid, output)
+        self.len_units = 'Angstrom'
 
-    def check_kpoints(self):
-        to_ang_local = to_ang
-        try:
-            if "Ang" in self.len_units:
-                to_ang_local = 1
-                #print "units angs"
-        except AttributeError:
-            print_and_log("Warning! no len_units for "+self.name+" calculation, I use Bohr \n") 
-        N_from_kspacing = []
-        # print self.set.vasp_params['KSPACING']
-        print 
-        for i in 0, 1, 2:
-            N_from_kspacing.append( math.ceil( (np.linalg.norm(self.init.recip[i]) / to_ang_local) / self.set.vasp_params['KSPACING']) )
-        #print "Vector length is:", (np.linalg.norm(self.rprimd[0]), "Bohr"
 
-        if self.set.kpoints_file  == False:#self.set.vasp_params['KSPACING']:
-            N = N_from_kspacing
 
-        if self.set.ngkpt:
-            N = self.set.ngkpt
+    def read_poscar(self, filename, version = None):
+        """Read POSCAR file
+        """
+
+        selective_dynamics = None
+
+        if self.path["input_geo"] == None:
+            self.path["input_geo"] = filename
+        self.path["poscar"] = filename
+        
+
+        self.hex_a = None
+        self.hex_c = None
+        self.gbpos = None
+
+
+        #Determine version
+        if version:
+            self.version = version
         else:
+            print_and_log('Trying to find version at the end of filename POSCAR-v ...')
+            try:
+                ver = int(filename.split('-')[-1])
+                print_and_log('OK\n')
+
+            except:
+                print_and_log('\nTrying to find version at the begenning of filename v.POSCAR...')
+
+                try:
+                    ver = int(os.path.basename(filename).split('.')[0] )
+                    print_and_log('OK\n')
+               
+                except:
+                    print_and_log('No version, using 1\n')
+                    ver = 1
+
+            self.version = ver
+
+
+        elements_list = []
+
+        self.init = Structure()
+        st = self.init
+        
+        st.name = os.path.basename(filename).replace('POSCAR', '').replace('CONTCAR', '')
+        
+        try:
+            if '.' in st.name[-1]:
+                st.name = st.name[0:-1]
+        except:
+            pass
+
+
+        with open(filename,'r') as f:
+            name = f.readline().strip()
+            # print self.name, "self.name"
+
+            self.des = name
+
+            # st.name = self.name
+            # print(f.readline())
+            mul = float( f.readline().split('!')[0] )
+            # print 'mul', mul
+
+
+            st.rprimd = []
+            for i in 0, 1, 2:
+                vec = f.readline().split()
+                st.rprimd.append( np.asarray([float(vec[0])*mul, float(vec[1])*mul, float(vec[2])*mul]) )
+
+            st.nznucl = []
+
+            ilist = f.readline().split() #nznucl of elements?
+            
+            try:
+                int(ilist[0])
+                vasp5 = False
+            except:
+                vasp5 = True
+
+
+            if vasp5:
+                printlog('Vasp5 detected')
+                for el in ilist:
+                    elements_list.append(el)
+                printlog('elements_list:', elements_list)
+
+                ilist = f.readline().split()
+            else:
+                printlog('Vasp4 detected')
+
+
+            
+            for z in ilist:
+                st.nznucl.append( int(z)  )
+
+
+            temp_line = f.readline()
+
+            if temp_line[0] in ['s', 'S']:
+                printlog('selective dynamics detected') 
+                selective_dynamics = True
+                temp_line = f.readline()
+
+            type_of_coordinates = temp_line
+
+
+            st.xred = []
+
+            coordinates = []
+            select = []
+
+
+            if len(elements_list) > 0:
+                read_elements = 0
+            else:
+                read_elements = 1
+
+            for nz in st.nznucl:
+
+                for i in range(nz):
+                    vec = f.readline().split()
+                    coordinates.append( np.asarray([float(vec[0]), float(vec[1]), float(vec[2])]) )
+
+                    if read_elements and len(vec) == 4: # elements may be added by pymatgen
+                        # print_and_log("Probably elements names are added at the end of coordinates, trying to read them")
+                        if vec[3] not in elements_list:
+                            elements_list.append(vec[3])
+                    
+                    if selective_dynamics:
+                        # convert 'T'/'F' to True/False
+                        flagset = [True, True, True]
+                        for fi, flag in enumerate(vec[3:6]):
+                            if flag == 'F':
+                                flagset[fi] = False
+                        select.append(flagset)
+
+            st.select = select
+            if "Car" in type_of_coordinates or 'car' in type_of_coordinates:
+                st.xcart  = coordinates
+                st.xred = xcart2xred(st.xcart, st.rprimd)
+                
+            elif "dir" in type_of_coordinates or 'Dir' in type_of_coordinates:
+                st.xred  = coordinates
+                st.xcart = xred2xcart(st.xred, st.rprimd)
+
+
+            elif 'None' in type_of_coordinates:
+                pass
+
+            else:
+                print_and_log("Error! The type of coordinates should be 'car' or 'dir' ")
+                raise NameError
+
+
+
+            if 'Species order:' in name:
+                print_and_log('I detect that input file was generated by cif2cell\n')
+                name = name.split(':')[-1]
+
+
+            if not elements_list:
+                elements_list = name.split('!')[0].strip().split()
+                print_and_log('I take elements from the first line, The line is '+str(name.split('!'))+' you could use ! to add comment after name+\n')
+                # print(elements_list)
+                if 'i2a' in elements_list[0]:
+                    printlog('i2a list detected')
+                    el = elements_list[0].split('[')[-1].replace(']','')
+                    elements_list = el.split(',')
+            else:
+                print_and_log("Elements names have been taken from the end of coordinates, pymatgen file?\n")
+
+
+
+            st.znucl = []
+            for elname in elements_list:
+                st.znucl.append( element_name_inv(elname) )
+            # print_and_log('znucl is ')
+
+
+
+            st.natom = len(st.xred)
+
+            st.ntypat = len(st.znucl)
+
+            st.typat = []
+            for i, nz in enumerate(st.nznucl):
+                for j in range(nz):
+                    st.typat.append(i+1)
+
+            #Determine reciprocal vectors
+            st.recip = st.get_recip()
+
+
+                # if hasattr(self.init, 'vel'):
+                #     print "I write to POSCAR velocity as well"
+                #     f.write("Cartesian\n")
+                #     for v in self.init.vel:
+                #         f.write( '%.12f %.12f %.12f\n'%(v[0]*to_ang, v[1]*to_ang, v[2]*to_ang) )
+
+        print_and_log('The following Z were read = '+ str(self.init.znucl)+'\n')
+
+
+        print_and_log( "POSCAR was read\n")
+        return
+    
+
+    def check_kpoints(self, ngkpt = None):
+        """
+        The method updates init.ngkpt and ngkpt_dict_for_kspacings !!! as well provides possible options for it
+        TODO probably the method should transfered to Structure?
+        Attention: the order should be the same as in make_kpoints_file
+        """
+        struct_des = header.struct_des
+        # to_ang_local = header.to_ang
+        to_ang_local = 1
+        
+        # try:
+        #     if "Ang" in self.len_units:
+        #         to_ang_local = 1
+        #         #print "units angs"
+        # except AttributeError:
+        #     print_and_log("Warning! no len_units for "+self.name+" calculation, I use Bohr \n") 
+        
+        N_from_kspacing = []
+
+        it = self.id[0]
+
+
+        if not hasattr(struct_des[it], 'ngkpt_dict_for_kspacings'): #compatibiliy issues
+            struct_des[it].ngkpt_dict_for_kspacings = {}
+
+        ngkpt_dict = struct_des[it].ngkpt_dict_for_kspacings
+
+        # if self.set.kpoints_file  == False:#self.set.vasp_params['KSPACING']:
+        #     N = N_from_kspacing
+        kspacing = self.set.vasp_params['KSPACING']
+
+        # print (struct_des)
+        if ngkpt:
+            N = ngkpt
+
+        elif kspacing in ngkpt_dict:
+            N = ngkpt_dict[kspacing]
+            printlog('check_kpoints(): k-points will be used from *ngkpt_dict* of',it, N)
+        
+        elif self.set.ngkpt:
+            N = self.set.ngkpt
+            printlog('check_kpoints(): k-points will be used from set.ngkpt of',self.set.ise)
+
+
+        elif kspacing:
+            self.init.recip = self.init.get_recip()
+            for i in 0, 1, 2:
+                N_from_kspacing.append( math.ceil( (np.linalg.norm(self.init.recip[i]) / to_ang_local) / kspacing) )
+
             N = N_from_kspacing
+            printlog('check_kpoints(): k-points are determined from kspacing',kspacing)
+
+        elif self.set.kpoints_file:
+            print_and_log("K-points file was provided", self.set.kpoints_file)
+            N = None
+
+        else:
+            # print(self.dir)
+            print_and_log("Error! check_kpoints(): no information about k-points\n")
 
 
-        print_and_log("\nKpoint   mesh is: "+str(N) )
-        print_and_log("The actual k-spacings are "+str(self.calc_kspacings(N) ) )
+
+        self.init.ngkpt = N
+
+        if kspacing != None and kspacing not in ngkpt_dict:
+            ngkpt_dict[kspacing] = N
+            printlog('check_kpoints(): I added ',N,'as a k-grid for',kspacing,'in struct_des of', it)
+
+
+        print_and_log("check_kpoints(): Kpoint   mesh is: ", N, imp = 'Y')
+
+
+        if not hasattr(struct_des[it], 'ngkpt_dict_for_kspacings') or  kspacing not in struct_des[it].ngkpt_dict_for_kspacings:
+            print_and_log('Several other options instead of automatically determined ngkpt = ',N,np.array(self.calc_kspacings(N) ).round(2), ':', end = '\n', imp = 'y')
+            print_and_log('ngkpt              |    actual kspacings       ', end = '\n', imp = 'y' )
+            
+
+            for ngkpt in itertools.product([N[0]-1, N[0], N[0]+1], [N[1]-1, N[1], N[1]+1], [N[2]-1, N[2], N[2]+1]):
+                print_and_log(ngkpt, np.array(self.calc_kspacings(ngkpt) ).round(2), end = '\n', imp = 'y' )
+
+            # user_ngkpt = input('Provide ngkpt:')
+            # print(user_ngkpt)
+            # sys.exit()
+
+        else:
+            print_and_log("check_kpoints(): The actual k-spacings are ", np.array(self.calc_kspacings(N) ).round(2), imp = 'Y')
         return N_from_kspacing
 
 
@@ -646,17 +2562,18 @@ class CalculationVasp(Calculation):
            state - 'init' or 'end' 
         """
         #units
-        try:
-            if "ang" in self.len_units or "Ang" in self.len_units: 
-                global to_ang; to_ang = 1.0; print "Conversion multiplier to_ang is",to_ang 
-        except AttributeError:
-            pass
+        # try:
+        #     if "ang" in self.len_units or "Ang" in self.len_units: 
+        #         global to_ang; to_ang = 1.0; print_and_log("Conversion multiplier to_ang is "+str(to_ang) )
+        # except AttributeError:
+        #     pass
 
         if option == 'inherit_xred' and 'car' in type_of_coordinates: raise RuntimeError 
 
         if option == 'inherit_xred' and prevcalcver: type_of_coordinates = 'None' # do not write xred or xcart if they will be transfered on cluster
         
-        if path == None: path = self.dir
+        if path == None: 
+            path = self.dir
         
         if state == 'init':
             st  = self.init
@@ -665,76 +2582,14 @@ class CalculationVasp(Calculation):
         else: 
             raise RuntimeError 
         
-        rprimd = st.rprimd
-        xred   = st.xred
-        xcart  = st.xcart
-        typat = st.typat  
-        znucl = st.znucl
+        filename = os.path.join(path, name_of_output_file)
 
-        
-        print 
-        """1. Generate correct nznucl and zxred and zxcart"""
-        zxred  = [[] for i in znucl]
-        zxcart = [[] for i in znucl]
-        # nznucl = []
-        if len(typat) != len(xred) or len(xred) != len(xcart):
-            raise RuntimeError
-        for t, xr, xc in zip(typat, xred, xcart):
-            # print "t ", t, xr
-            zxred[ t-1].append(xr)
-            zxcart[t-1].append(xc)
-        
-        nznucl = [len(xred) for xred in zxred]
+        makedir(filename)
 
-        # print znucl, typat
-        # print zxred
-        # print nznucl
-        if not os.path.exists(path):
-            log.write( runBash("mkdir -p "+path) )
+        st.write_poscar(filename, coord_type = type_of_coordinates)
 
-        with open(path+'/'+name_of_output_file,'w') as f:
-            """Writes structure (POSCAR) in VASP format """
-            f.write(self.name)
-            
-            f.write("\n1\n")
-            
-            for i in 0, 1, 2:
-                f.write('  %18.16f %18.16f %18.16f'%(rprimd[i][0]*to_ang,rprimd[i][1]*to_ang,rprimd[i][2]*to_ang))
-                f.write("\n")
 
-            for n in nznucl:    
-                f.write(str(n)+' ')
 
-            f.write('\n')
-
-            if "car" in type_of_coordinates:
-                print "Warning! may be obsolete!!! and incorrect"
-                f.write("Cartesian\n")
-                for xcart in zxcart:
-                    for x in xcart:
-                        f.write(str(x[0]*to_ang)+" "+str(x[1]*to_ang)+" "+str(x[2]*to_ang))
-                        f.write("\n")
-
-                
-                if hasattr(self.init, 'vel'):
-                    print "I write to POSCAR velocity as well"
-                    f.write("Cartesian\n")
-                    for v in self.init.vel:
-                        f.write( '  {:18.16f}  {:18.16f}  {:18.16f}\n'.format(v[0]*to_ang, v[1]*to_ang, v[2]*to_ang) )
-
-            elif "dir" in type_of_coordinates:
-                f.write("Direct\n")
-                for xred in zxred:
-                    for x in xred:
-                        f.write("  {:18.16f}  {:18.16f}  {:18.16f}\n".format(x[0], x[1], x[2]) )
-            elif 'None' in type_of_coordinates:
-                pass
-
-            else:
-                print_and_log("Error! The type of coordinates should be 'car' or 'dir' ")
-                raise NameError
-        f.close()
-        print_and_log( "POSCAR was generated\n")
         return
 
 
@@ -742,44 +2597,313 @@ class CalculationVasp(Calculation):
     def add_potcar(self):
         """Should be run for the first calculation only"""
         #Add POTCAR
-        #try:
-        #    shutil.copy2(self.set.potdir[0]+'/POTCAR',self.dir)
-        #except IOError:
-        #    runBash("gunzip "+self.set.potdir[0]+"/POTCAR.Z")
 
-        path_to_potcar = self.dir+'/POTCAR'
-        potcar_files   = ""
+        path_to_potcar = os.path.join(self.dir, 'POTCAR')
+        potcar_files   = []
 
-        for z in self.init.znucl:
-            potcar_files += self.set.potdir[ int(z) ]+"/POTCAR "
+        if hasattr(self.set, 'path2pot' ) and self.set.path2pot:
+            path2pot = self.set.path2pot
+        else:
+            path2pot = header.PATH2POTENTIALS
+        printlog('Potentials from ', path2pot, 'are taken')
 
-        runBash("cat "+potcar_files+" >"+path_to_potcar)
+        if self.set.potdir:
+            # print (self.set.potdir)
+            for z in self.init.znucl:
+                
+                potcar_files.append(os.path.join(path2pot, self.set.potdir[ int(z) ], 'POTCAR') )
 
-        print_and_log( "POTCAR files: "+potcar_files+"\n")        
-        return
+            printlog("POTCAR files:", potcar_files)        
+            # print(path_to_potcar)            
+            cat_files(potcar_files, path_to_potcar)
+
+        
 
 
-    def calculate_nbands(self):
+        elif self.set.path_to_potcar:
+            printlog('Attention! set.path_to_potcar is used !', self.set.path_to_potcar)
+            shutil.copyfile(self.set.path_to_potcar, path_to_potcar)
+            printlog('POTCAR was copied to', path_to_potcar)
+            path_to_potcar = self.set.path_to_potcar
+
+
+        else:
+            printlog('Error! set.potdir and set.path_to_potcar are empty; no POTCAR was not created!')
+            path_to_potcar = None
+        
+        self.path['potcar'] = path_to_potcar
+
+        return path_to_potcar
+
+
+    def calculate_nbands(self, curset, path_to_potcar = None):
         """Should be run after add_potcar()"""
         #1 add additional information to set
-        path_to_potcar = self.dir+'/POTCAR'
-        self.init.zval = []
-        for line in open(path_to_potcar,'r'):
-            if "ZVAL" in line:
-                self.init.zval.append(float(line.split()[5]))
-        try: self.set.add_nbands
-        except AttributeError: self.set.add_nbands = None
+        if not curset:
+            curset = self.set
+        vp = curset.vasp_params
 
-        if self.set.add_nbands != None:
-            tve =0
-            for i in range(self.init.ntypat):
-                tve += self.init.zval[i] * self.init.nznucl[i]
-            self.nbands = int ( round ( math.ceil(tve / 2.) * self.set.add_nbands ) )
-            self.set.vasp_params['NBANDS'] = self.nbands
+        if path_to_potcar:
+            # path_to_potcar = self.dir+'/POTCAR'
+            self.init.zval = []
+            # print path_to_potcar
+            for line in open(path_to_potcar,'r'):
+                if "ZVAL" in line:
+                    # print line
+                    self.init.zval.append(float(line.split()[5]))
+            
+            try: 
+                curset.add_nbands
+            except AttributeError: 
+                curset.add_nbands = None
+
+            if curset.add_nbands != None:
+                tve =0
+                for i in range(self.init.ntypat):
+                    # print self.init.zval
+                    tve += self.init.zval[i] * self.init.nznucl[i] #number of electrons 
+                    # print(self.init.zval[i], self.init.nznucl[i])
+                nbands_min = math.ceil(tve / 2.)
+                self.nbands = int ( round ( nbands_min * curset.add_nbands ) )
+                # print(self.nbands)
+                
+
+                vp['NBANDS'] = self.nbands
+                printlog('I found that at least', nbands_min, ' bands are required. I will use', self.nbands, 'bands; add_nbands = ', curset.add_nbands)
+
+
+
+
+
+            if 'LSORBIT' in vp and vp['LSORBIT']:
+                # print (vp)
+                printlog('SOC calculation detected; increasing number of bands by two', imp = 'Y')
+                vp['NBANDS']*=2
+        else:
+            printlog('Attention! No path_to_potcar! skipping NBANDS calculation')
+
         return
 
 
-    def make_incar_and_copy_all(self, update):
+    def actualize_set(self, curset = None):
+        """
+        Makes additional processing of set parameters, which also depends on calculation
+        """
+
+
+        #check if some parameters should be filled according to number of species
+        #make element list
+        el_list = [element_name_inv(el) for el in self.init.znucl]
+        if not curset:
+            curset = self.set
+        vp = curset.vasp_params
+
+        # print(['LDAU'])
+        # print(vp)
+        # print(vp['LDAU'])
+
+        if 'LDAU' in vp and vp['LDAU']: 
+            # print(vp['LDAU'])
+
+            for key in ['LDAUL', 'LDAUU', 'LDAUJ']:
+                # print( vp[key])
+                try:
+                    if set(vp[key].keys()).isdisjoint(set(el_list)): #no common elements at all
+                        print_and_log('\n\n\nAttention! The '+str(key)+' doesnt not contain values for your elements! Setting to zero\n\n\n')
+                        # raise RuntimeError
+
+                    new = []
+                    for el in el_list:
+                        
+                        if el in vp[key]:
+                            val = vp[key][el]
+                            
+                            if 'S' in el_list:  # use another value in the format of Fe/S
+                                kk = el+'/S' 
+                                if kk in vp[key]:
+                                    val = vp[key][kk]
+                    
+
+
+
+
+
+                        else:
+                            if key == 'LDAUL':
+                                val = -1
+                            else:
+                                val =  0
+
+                        new.append(val)
+                    
+                    vp[key] = new
+                
+                except AttributeError:
+                    printlog('Error! LDAU* were not processed')
+                    pass
+
+        """Process magnetic moments"""
+        if self.calc_method and 'afm_ordering' in self.calc_method:
+            self.init.magmom = [None]
+
+
+
+        # print(hasattr(self.init, 'magmom') and hasattr(self.init.magmom, '__iter__') and not None in self.init.magmom)
+        # print(self.init.magmom)
+        # print(None in self.init.magmom)
+        # sys.exit()
+        if hasattr(self.init, 'magmom') and hasattr(self.init.magmom, '__iter__') and not None in self.init.magmom and bool(self.init.magmom):
+
+            print_and_log('actualize_set(): Magnetic moments are determined from self.init.magmom:',self.init.magmom, imp = 'y')
+
+        elif hasattr(curset, 'magnetic_moments') and curset.magnetic_moments:
+            print_and_log('actualize_set(): Magnetic moments are determined using siman key "magnetic_moments" and corresponding dict in set', end = '\n')
+            print_and_log('curset.magnetic_moments = ', curset.magnetic_moments)
+            
+            mag_mom_other = 0.6 # magnetic moment for all other elements
+            magmom = []
+            for iat in range(self.init.natom):
+                typ = self.init.typat[iat]
+                el  = el_list[typ-1]
+                if el in curset.magnetic_moments:
+                    magmom.append(curset.magnetic_moments[el])
+                else:
+                    magmom.append(mag_mom_other)
+            
+
+            #convert magmom to vasp ordering
+
+            zmagmom = [[] for x in range(0,self.init.ntypat)]
+
+            # print zmagmom
+
+            for t, m in zip(self.init.typat, magmom):
+                # print "t, m = ", t, m
+                zmagmom[t-1].append(m)
+                # print t-1, zmagmom[3]
+
+            # print 'sdfsdf', zmagmom[3], 
+            magmom = [m for mag in zmagmom for m in mag  ]
+            # sys.exit()
+
+
+
+            # print el_list
+            # print self.init.typat
+            # print magmom
+                
+            vp['MAGMOM'] = magmom
+
+            #check possible antiferromagnetic configurations:
+            spec_mom_is = []
+            for i, m in enumerate(magmom):
+                if m != mag_mom_other: #detected some specific moment
+                    spec_mom_is.append(i)
+
+            if len(spec_mom_is) % 2 == 0 and len(spec_mom_is) > 0:
+                print_and_log('Number of elements is even! trying to find all antiferromagnetic orderings:', imp = 'y')
+                ns = len(spec_mom_is); 
+                number_of_ord = int(math.factorial(ns) / math.factorial(0.5 * ns)**2)
+                
+                if number_of_ord > 10000:
+                    printlog('Attention! Too much orderings (1000), skipping ...')
+                else:
+                    nords = 71
+                    use_each = number_of_ord // nords  # spin() should be improved to find the AFM state based on the number of configuration 
+                    if use_each == 0:
+                        use_each = 1
+
+                    if number_of_ord > nords:
+                        print_and_log('Attention! Number of orderings is', number_of_ord, ' more than', nords, ' - I will check only each first ', imp = 'y')
+                # else:
+
+                    ls = [0]*len(spec_mom_is)
+                    # print ls
+                    orderings = []
+                    
+
+
+
+                    def spin(ls, i):
+                        """
+                        Find recursivly all possible orderings
+                        ls - initial list of mag moments
+                        i - index in ls  
+
+                        """
+                        nonlocal i_current
+                        if len(orderings) < nords:
+
+                            for s in 1,-1:
+                                
+                                ls[i] = s
+                                
+                                if i < len(ls)-1:
+                                
+                                    spin(ls, i+1)
+                                
+                                else:
+                                    if sum(ls) == 0:
+                                        i_current+=1  
+                                        # print (i_current)
+
+                                        if 1: #  i_current % use_each == 0:  # every use_each will be calculated; two slow even for sampling!
+                                            orderings.append(copy.deepcopy(ls) )  
+                                            # print (i_current)
+                        return
+
+                    i_current = 0
+                    spin(ls, 0)
+
+                    mag_orderings = []
+                    mag_orderings.append(magmom)
+                    printlog('Only '+str(nords)+' orderings equally sampled along the whole space are checked !')
+
+
+
+
+                    for j, order in enumerate(orderings):
+                        
+                        # if j >nords: # old behaviour - just first ten orderings were checked
+                        #     break
+
+                        new_magmom = copy.deepcopy(magmom)
+                        for i, s in zip(spec_mom_is, order):
+                            # print i
+                            new_magmom[i] = s * magmom[i]
+                        
+
+                        printlog(j, new_magmom,)
+                        
+                        mag_orderings.append(new_magmom)
+
+                    # print orderings
+                    print_and_log('Total number of orderings is ', len(orderings),imp = 'y')
+                    
+                    if self.calc_method and 'afm_ordering' in self.calc_method:
+                        self.magnetic_orderings = mag_orderings
+
+                    
+
+
+            self.init.magmom = magmom
+
+        
+        elif 'MAGMOM' in vp and vp['MAGMOM']: #just add * to magmom tag if it is provided without it
+            print_and_log('Magnetic moments from vasp_params["MAGMOM"] are used\n')
+            
+            # if "*" not in vp['MAGMOM']:
+            #     vp['MAGMOM'] = str(natom) +"*"+ vp['MAGMOM']
+        
+
+
+        # print (self.init.magmom, 'asdfaaaaaaaaaaaa')
+        
+        # sys.exit()
+
+        return
+
+    def make_incar(self):
         """Makes Incar file for current calculation and copy all
         TO DO: there is no need to send all POSCAR files; It is enothg to send only one. However for rsync its not that crucial
         """
@@ -787,61 +2911,143 @@ class CalculationVasp(Calculation):
         
         
         #Generate incar
-
-
-        with open(self.dir+"INCAR",'w') as f:
-            f.write( 'SYSTEM = %s\n\n'%(self.des) )
-            #f.write( 'Other parameters for this Run:\n' )
-            for key in sorted(self.set.vasp_params):
-                if self.set.vasp_params[key] == None:
-                    continue
-                #print type(self.set.vasp_params[key])
-                if type(self.set.vasp_params[key]) == list:
-                    f.write(key+" = "+str(self.set.vasp_params[key][0])+" "+str(self.set.vasp_params[key][1])+"\n")
-                else:
-                    f.write(key+" = "+str( self.set.vasp_params[key] ) +"\n")
-            try:
-                if self.set.vasp_params['ISPIN'] == 2 and self.init.magmom[0]: #write magnetic moments of atoms
-                    f.write("MAGMOM = ")
-                    for m in self.init.magmom:    
-                        f.write(str(m)+' ')
-                    f.write("\n")
-            except KeyError:
-                pass
-
-            f.write("\n")
-            #f.write( 'Electronic Relaxation 1:\n' )
-
-            #f.write("\n")
-            #f.write( 'Ionic Relaxation:\n' )
-       
-            #f.write("\n")
-        print_and_log( "INCAR was generated\n")
-
-        #Generate KPOINTS
+        varset = header.varset
         d = self.dir
-        if self.set.kpoints_file:
+        natom = self.init.natom
+        incar_list = []
+
+        setseq = [self.set]
+        
+        if hasattr(self.set, 'set_sequence') and self.set.set_sequence:
+            for s in self.set.set_sequence:
+                setseq.append(s)
+
+
+        nsets = len(setseq)
+        for i, curset in enumerate(setseq):
+
+            if nsets == 1:
+                name_mod = ''
+            else:
+                name_mod = curset.ise+'.'
+
+            incar_filename = d+name_mod+'INCAR'
+            vp = curset.vasp_params
+            
+
+            with open(incar_filename,'w', newline = '') as f:
+
+                f.write( 'SYSTEM = ')
+                if hasattr(self.init, 'perm'):
+                    f.write( 'perm=[{:s}] ; '.format( list2string([i+1 for i in self.init.perm]).replace(' ', ',') )) #write permuations
+                f.write( '{:s}\n'.format(self.des) )
+
+
+                for key in sorted(vp):
+    
+                    if key == 'SYSTEM':
+                        ''
+                    elif key == 'MAGMOM' and hasattr(self.init, 'magmom') and self.init.magmom and any(self.init.magmom): #
+                        f.write('MAGMOM = '+list2string(self.init.magmom)+"\n") #magmom from geo file has higher preference
+                   
+                    elif vp[key] == None:
+                        ''
+
+                    elif key == 'KSPACING' and self.set.kpoints_file: #attention! for k-points only the base set is used!!
+                        '' # since VASP has higher priority of KSPACING param, it should not be written 
+
+                    elif is_list_like(vp[key]):
+                        lis = vp[key]
+                        f.write(key + " = " + ' '.join(['{:}']*len(lis)).format(*lis) + "\n")
+                   
+                    else:
+                        f.write(key+" = "+str( vp[key] ) +"\n")
+               
+
+                f.write("\n")
+
+
+
+
+            print_and_log(incar_filename, "was generated\n")
+        
+            incar_list.append(incar_filename)
+        
+
+        return incar_list
+
+
+
+
+    
+    def make_kpoints_file(self):
+
+        struct_des = header.struct_des
+        #Generate KPOINTS
+        kspacing = self.set.vasp_params['KSPACING']
+
+        filename = os.path.join(self.dir, "KPOINTS")
+
+        it = self.id[0]
+
+
+
+        if hasattr(self.set, 'k_band_structure') and self.set.k_band_structure:
+            k = self.set.k_band_structure
+            printlog('Writing k-points file for band structure calculation.', imp = 'y')
+            
+            with open(filename, 'w', newline = '') as f:
+                f.write('k-points along high symmetry lines\n')
+                f.write('{:} ! intersections\n'.format(k[0]))
+                f.write('Line-mode\n')
+                f.write('rec\n') # now only reciprocal are supported
+                ps= k[1]
+                for pn in k[2:]:
+                    # pn  = next(k)
+                    f.write('{:6.3f} {:6.3f} {:6.3f} ! {:s}\n'.format(ps[1], ps[2], ps[3], ps[0]) ) 
+                    f.write('{:6.3f} {:6.3f} {:6.3f} ! {:s}\n\n'.format(pn[1], pn[2], pn[3], pn[0]) ) 
+                    ps = pn
+
+
+
+
+
+        elif self.set.kpoints_file:
             if self.set.kpoints_file == True:
+
                 print_and_log( "You said to generate KPOINTS file.\n")
                 self.calc_kspacings()
                 #Generate kpoints file
 
                 #
-                if self.set.ngkpt:
+                if hasattr(struct_des[it], 'ngkpt_dict_for_kspacings') and kspacing in struct_des[it].ngkpt_dict_for_kspacings:
+                    N =    struct_des[it].ngkpt_dict_for_kspacings[kspacing]
+                    print_and_log( 'Attention! ngkpt = ',N, 
+                        ' is adopted from struct_des which you provided for it ',it, ' and kspacing = ',kspacing)
+                    nk1 = N[0]; nk2 = N[1]; nk3 = N[2]
+                    self.set.ngkpt = N
+
+                elif self.set.ngkpt:
                     nk1 = self.set.ngkpt[0]; nk2 = self.set.ngkpt[1]; nk3 = self.set.ngkpt[2];
                     print_and_log( "Attention! ngkpt was used for kpoints file\n")
 
-                else:
+                
+                elif kspacing:
                     print_and_log( "Attention! ngkpt for kpoints file are created from kspacing; ngkpt is empty\n")
                     N = self.check_kpoints()
                     self.set.ngkpt = N
                     nk1 = N[0]; nk2 = N[1]; nk3 = N[2]
                 
-                with open(self.dir+"KPOINTS",'w') as f:
+                else:
+                    print_and_log( "Error! could not find information about k-points\n")
+
+
+
+                with open(filename,'w', newline = '') as f:
 
                     f.write("Automatic Mesh\n") #Comment
                     f.write("0 \n")#Number of points; 0-Auto
-                    if self.set.vasp_params["KGAMMA"] == ".TRUE.": 
+                    if 'KGAMMA' in self.set.vasp_params and self.set.vasp_params["KGAMMA"] in (1,'.TRUE.', 'True', '1'): 
                         f.write("Gamma\n")
                     else: 
                         f.write("Monkhorst Pack\n")
@@ -849,508 +3055,1566 @@ class CalculationVasp(Calculation):
                     f.write("0 0 0\n") # optional shift
 
                 print_and_log( "KPOINTS was generated\n")
+            
             else:
-                shutil.copyfile(self.set.kpoints_file, self.dir+"KPOINTS")
+                # print()
+                shutil.copyfile(self.set.kpoints_file, filename)
                 print_and_log( "KPOINTS was copied from"+self.set.kpoints_file+"\n")
 
 
 
-            list_to_copy = [d+"INCAR",d+"POTCAR",d+"KPOINTS"]
-
         else:
             print_and_log( "This set is without KPOINTS file.\n")
-
-            list_to_copy = [d+"INCAR",d+"POTCAR"]
-
-            #N = []
-            #for i in 0, 1, 2:
-                #N.append( math.ceil( (np.linalg.norm(self.recip[i]) / to_ang) / self.set.vasp_params['KSPACING']) )
-            #print "Vector length is:", (np.linalg.norm(self.rprimd[0]), "Bohr"
-            #print_and_log("Kpoint   mesh is: "+str(N) )
-            #print_and_log("The actual k-spacings is "+str(self.calc_kspacings(N) ) )
-        #Copy section
+            filename = ''
 
 
-        list_to_copy.extend( glob.glob(d+'/*POSCAR*') )
-        list_to_copy.extend( glob.glob(d+'/*.run*') )
-        string_of_paths = ""
 
-        for nf in list_to_copy:
-            string_of_paths += nf+" " #Compose all files for copy in one string
+        return [filename]
+
+    def copy_to_cluster(self, list_to_copy, update):
+        d = self.dir
+        list_to_copy.append( os.path.join(d, 'POTCAR')  )
+        list_to_copy.extend( glob.glob(   os.path.join(d, '*POSCAR*')  ) )
+        # list_to_copy.extend( glob.glob(   os.path.join(d, '*.run*'  )  ) )
+
+        if 'OCCEXT' in self.set.vasp_params and self.set.vasp_params['OCCEXT'] == 1:
+            list_to_copy.append(  os.path.join(d, 'OCCMATRIX')   )
 
         
         if "up" in update: #Copy to server
-            print_and_log("Files to copy: "+string_of_paths)
-            log.write( runBash("rsync -zave ssh "+string_of_paths+" "+cluster_address+":"+project_path_cluster+self.dir)+"\n" )
-        #print "End make---------------------------------------------\n\n"
+            printlog('Files to copy:', list_to_copy)
+
+            # command = ' mkdir -p {:}'.format( os.path.join(self.project_path_cluster, self.dir)  )
+
+            # run_on_server(command, self.cluster_address)
+
+            push_to_server(list_to_copy,  os.path.join(self.project_path_cluster, self.dir), self.cluster_address)
+
+
+        return
 
 
 
-    def write_sge_script(self, input_geofile = "header", version = 1, option = None, prevcalcver = None, savefile = "all"):
+    def write_sge_script(self, input_geofile = "header", version = 1, option = None, 
+        prevcalcver = None, savefile = None, schedule_system = None,
+        output_files_names = None,
+        mode = None,
+        batch_script_filename = None):
         """Without arguments writes header, else adds sequence of calculatios
             option - 'inherit_xred' - control inheritance, or 'master' - run serial on master 
             prevcalcver - ver of previous calc; for first none
-            savefile - all, allw - +wavecar
-
+            savefile - 'cdawx', where c-charge, d-dos, a- AECCAR, w-wavefile, x-xml
+            schedule_system - type of job scheduling system:'PBS', 'SGE', 'SLURM'
+            mode - 
+                body
+                footer
         """
 
-        type = 'SGE'
-        type = 'PBS'
+
+        # print 'Starting write_sge()', input_geofile
+        varset = header.varset
         
-        if type == 'SGE':
-            parrallel_run_command = "mpirun -x PATH vasp"
-        if type == 'PBS':
-            parrallel_run_command = "mpiexec vasp"
+        f = open(batch_script_filename,'a', newline = '') #
+
+        # print(savefile)
+        # sys.exit()
 
 
+        def prepare_input(prevcalcver = None, option = None, input_geofile = None, name_mod_prev = '', write = True, 
+            curver = None, copy_poscar_flag = True):
+            """1. Input files preparation
 
-        run_name = self.dir+self.id[0]+"."+self.id[1]+'.run'        
-        if input_geofile == "header":
-            with open(run_name,'w') as f:
-                if type == 'SGE':
-                    f.write("#!/bin/tcsh   \n")
-                    f.write("#$ -M aksenov@mpie.de\n")
-                    f.write("#$ -m be\n")
-                    f.write("#$ -S /bin/tcsh\n")
-                    f.write("#$ -cwd \n")
-                    f.write("#$ -R y \n")
-                    f.write("#$ -o "+self.dir+" -j y\n\n")
-
-                    f.write("cd "+self.dir+"\n")
-                    f.write("module load sge\n")
-                    f.write("module load vasp/parallel/5.2.12\n\n")
-                    f.write("rm WAVECAR\n")
-
-                if type == 'PBS':
-                    f.write("#!/bin/bash   \n")
-                    f.write("#PBS -N "+run_name+"\n")
-                    f.write("#PBS -l walltime=99999999:00:00 \n")
-                    f.write("#PBS -l nodes=1:ppn="+str(header.corenum)+"\n")
-                    f.write("#PBS -r n\n")
-                    f.write("#PBS -j eo\n")
-                    f.write("#PBS -m bea\n")
-                    f.write("#PBS -M dimonaks@gmail.com\n")
-                    f.write("cd $PBS_O_WORKDIR\n")
-                    f.write("PATH=/share/apps/vasp/bin/vasp:/usr/bin/mpiexec:$PATH \n")
-
-                    # f.write("cd "+self.dir+"\n")
-
-                    # f.write("module load sge\n")
-                    # f.write("module load vasp/parallel/5.2.12\n\n")
-                    f.write("rm WAVECAR\n")                
+                curver - current version
+            """  
 
 
-
-
-            # f.close()
-
-
-
-
-        else:
-            v = str(version)
-            precont = str(prevcalcver)+'.CONTCAR'
-            #POSC = str(version)+'.POSCAR'
-            with open(run_name,'a') as f: #append information about run
-                
+            if write:
+                # if not 'only_neb' in self.calc_method:
+                precont = str(prevcalcver)+name_mod_prev+'.CONTCAR' #previous contcar
                 if option == 'inherit_xred' and prevcalcver:
-                    f.write('grep -A '+str(self.init.natom)+ ' "Direct" '+precont+' >> '+input_geofile+ ' \n')
+                    if copy_poscar_flag:
 
-                f.write("cp "+input_geofile+" POSCAR\n")
-                if option == 'master':
-                    f.write("vasp >"+self.name+".log\n")
-                else:
-                    f.write(parrallel_run_command +" >"+self.name+".log\n")
-                
-                f.write("sleep 20\n")
-                # f.write("mv " +"POSCAR "  + "CONTCAR\n") #test
-                
-                f.write("mv OUTCAR "  + v+".OUTCAR\n")
-                f.write("mv CONTCAR " + v+".CONTCAR\n")
-                
-                if "all" in savefile:
-                    f.write("mv CHG "     + v+".CHG\n")
-                    f.write("mv CHGCAR "  + v+".CHGCAR\n")
-                    f.write("mv DOSCAR "  + v+".DOSCAR\n")
-                    # f.write("mv PROCAR "  + v+".PROCAR\n")
-                    f.write("mv AECCAR0 " + v+".AECCAR0\n")
-                    f.write("mv AECCAR2 " + v+".AECCAR2\n")
-                    if 'w' in savefile:
-                        f.write("mv WAVECAR " + v+".WAVECAR\n")
-                    if 'x' in savefile:
-                        f.write("mv vasprun.xml " + v+".vasprun.xml\n")
-                else:
+                        f.write('grep -A '+str(self.init.natom)+ ' "Direct" '+precont+' >> '+input_geofile+ ' \n')
 
-                    # f.write("rm CHG\n")
-                    # f.write("rm CHGCAR\n")
-                    pass
-                f.write("rm WAVECAR\n")
-                f.write("\n")
+                if copy_poscar_flag: # only for first set 
+                    if option == 'continue': #test for the case of sequence set - OK
+                        ''
+                        precont = str(curver)+name_mod_prev+'.CONTCAR ' #previous contcar
+                        preout  = str(curver)+name_mod_prev+'.OUTCAR ' #previous outcar
+                        f.write("cp "+precont+" POSCAR  # inherit_option = continue\n")
+                        f.write("cp "+preout+'prev.'+preout+" # inherit_option = continue\n")
+                        f.write('mv CHGCAR prev.CHGCAR   # inherit_option = continue\n')
+                    
+                    else:
+                        f.write("cp "+input_geofile+" POSCAR\n")
+        
 
-            f.close()
-            runBash('chmod +x '+run_name)
+
 
             return
-    def make_run(self):
-        #Generate run file
 
 
-        type = 'SGE'
-        type = 'PBS'
 
-        run_name = self.dir+self.id[0]+"."+self.id[1]+'.run'
+        def update_incar(parameter = None, value = None, u_ramp_step = None, write = True):    
+            """Modifications of INCAR. Take attention that *parameter* will be changed to new *value*
+            if it only already exist in INCAR.  *u_ramp_step*-current step to determine u,
+            *write*-sometimes just the return value is needed. 
+            Returns U value corresponding to *u_ramp_step*.
+            """
 
-        with open('run','a') as f:
-            if type == 'SGE':
+            u_step = None
+            if parameter == 'LDAUU':
+                #Update only non-zero elements of LDAUU with value
+
+                set_LDAUU_list = self.set.vasp_params['LDAUU']
+                new_LDAUU_list = copy.deepcopy(set_LDAUU_list)
+                
+                # print set_LDAUU_list
+                u_step = 0.0
+                for i, u in enumerate(set_LDAUU_list):
+                    if u == 0:
+                        continue
+                    u_step = np.linspace(0, u, self.set.u_ramping_nstep)[u_ramp_step]
+                    u_step = np.round(u_step, 1)
+                    # new_LDAUU_list[i] = value
+                    new_LDAUU_list[i] = u_step
+
+
+                new_LDAUU = 'LDAUU = '+' '.join(['{:}']*len(new_LDAUU_list)).format(*new_LDAUU_list)
+                
+                command = "sed -i.bak '/LDAUU/c\\" + new_LDAUU + "' INCAR\n"
+                #print('u_step',u_step)
+                #sys.exit()
+
+            elif parameter == 'MAGMOM':
+
+                new_incar_string = parameter + ' = ' + ' '.join(['{:}']*len(value)).format(*value)
+                command = "sed -i.bak '/"+parameter+"/c\\" + new_incar_string + "' INCAR\n"
+
+            elif parameter in ['IMAGES', 'ISPIN']:
+
+                new_incar_string = parameter + ' = ' + str(value)
+                command = "sed -i.bak '/"+parameter+"/c\\" + new_incar_string + "' INCAR\n"
+
+
+
+
+            if write:
+                f.write(command)
+
+            return  u_step #for last element
+
+        def run_command(option, name, parrallel_run_command, condition = False, write = True):
+            """2. write commands for running vasp. condition = true allows override additional conditions""" 
+
+            if write:
+                # if not condition:
+                #     condition = (not 'only_neb' in self.calc_method)
+
+                # if condition:
+                if option == 'master':
+                    f.write("vasp >"+name+".log\n")
+                else:
+                    f.write(parrallel_run_command +" >"+name+".log\n")
+                
+                f.write("sleep 20\n")
+            return
+
+
+        def mv_files_according_versions(savefile, v, name_mod = '', write = True, rm_chg_wav = 'cw',
+            ):    
+            """3. Out files saving block
+                
+                rm_chg_wav - if True than CHGCAR and WAVECAR are removed
+
+            """   
+            printlog('The value of savefile is', savefile)
+            if write:
+                pre = v + name_mod
+
+                contcar = pre+'.CONTCAR'
+
+                if "o" in savefile:
+
+                    f.write("mv OUTCAR "          + v + name_mod +  ".OUTCAR\n")
+                    f.write("mv CONTCAR "         + contcar+'\n')
+
+                if "i" in savefile:
+                    f.write("cp INCAR "           + v + name_mod +  ".INCAR\n")
+                
+                if "v" in savefile: # v means visualization chgcar
+                    chg  = pre + '.CHG'
+                    f.write("mv CHG "+chg+"\n")
+                    f.write("gzip -f "+chg+"\n")
+                
+                if 'c' in savefile: # 
+                    fln = 'CHGCAR'
+                    chgcar  = pre +'.'+fln
+                    f.write('cp '+fln+' '+chgcar+'\n') #use cp, cause it may be needed for other calcs in run
+                    f.write('gzip -f '+chgcar+'\n')                
+
+                if 'p' in savefile: # 
+                    fln = 'PARCHG'
+                    parchg  = pre +'.'+fln
+                    f.write('cp '+fln+' '+parchg+'\n') #use cp, cause it may be needed for other calcs in run
+                    f.write('gzip -f '+parchg+'\n') 
+
+                # else:
+                #     f.write("rm CHG \n") #file can be used only for visualization
+
+
+                if "d" in savefile:
+                    fln = 'DOSCAR'
+                    doscar  = pre +'.'+fln
+                    f.write('mv '+fln+' '+doscar+'\n')
+                    f.write('gzip -f '+doscar+'\n')                
+                
+
+
+                if "a" in savefile:
+                    f.write("mv AECCAR0 "     + v + name_mod + ".AECCAR0\n")
+                    f.write("mv AECCAR2 "     + v + name_mod + ".AECCAR2\n")
+                
+                if 'x' in savefile:
+                    f.write("mv vasprun.xml " + v + name_mod + ".vasprun.xml\n")
+               
+                if 'w' in savefile:
+                    fln = 'WAVECAR'
+                    wavecar  = pre +'.'+fln
+                    # f.write("mv WAVECAR "     + v + name_mod + ".WAVECAR\n")
+                    f.write('mv '+fln+' '+wavecar+'\n') #
+                    f.write('gzip -f '+wavecar+'\n')  
+                    rm_chg_wav = rm_chg_wav.replace('w','')
+                # else:
+                #     f.write("rm WAVECAR\n")
+
+
+                if 'c' in rm_chg_wav:
+                    f.write("rm CHGCAR   # rm_chg_wav flag\n") #file is important for continuation
+                if 'w' in rm_chg_wav:
+                    ''
+                    f.write("rm WAVECAR  # rm_chg_wav flag\n") #
+                if 'v' in rm_chg_wav: #chgcar for visualization
+                    ''
+                    f.write("rm CHG   # rm_chg_wav flag\n") #
+
+            return contcar
+
+
+        def analysis_script(write = True):
+            #now only for u-ramping
+            if write:
+                f.write("touch ENERGIES\n")                
+
+                for outcar in self.associated_outcars:
+                    f.write("grep 'energy  without entropy' "+outcar+" | awk '{print $7}' >> ENERGIES\n")
+
+
+        def name_mod_U_last():
+            name_mod_last = 'U'+str(
+                        update_incar(parameter = 'LDAUU', 
+                            u_ramp_step = self.set.u_ramping_nstep-1, write = False)).replace('.','') #used to det last U
+
+            return name_mod_last
+
+
+        if schedule_system == 'SGE':
+            parrallel_run_command = "mpirun -x PATH vasp"
+        elif schedule_system in ['PBS', 'PBS_bsu']:
+            # parrallel_run_command = "mpiexec --prefix /home/aleksenov_d/mpi/openmpi-1.6.3/installed vasp" bsu cluster
+            # parrallel_run_command = "mpirun  vasp_std" #skoltech cluster
+            parrallel_run_command = header.vasp_command #skoltech cluster
+        
+        elif schedule_system == 'SLURM':
+            # parrallel_run_command = "prun /opt/vasp/bin/vasp5.4.1MPI"
+            parrallel_run_command = header.vasp_command
+        else:
+            raise RuntimeError
+
+
+        run_name = batch_script_filename     
+        job_name = self.id[0]+"."+self.id[1]
+        neb_flag = ('neb' in self.calc_method or 'only_neb' in self.calc_method)
+
+        if hasattr(self.set, 'set_sequence') and self.set.set_sequence and any(self.set.set_sequence):
+            sets = [self.set]+[se for se in self.set.set_sequence]
+        else:
+            sets = [self.set]
+
+
+
+
+ 
+        def write_body(v = None, savefile = None, set_mod = '', copy_poscar_flag = True,
+            final_analysis_flag = True, penult_set_name = None, curset = None):
+            """
+            set_mod (str) - additional modification of names needed for *set_sequence* regime, should be '.setname'
+            """
+            if 'only_neb' in self.calc_method:
+                write = False
+                write_poscar = False
+            else:
+                write = True
+                write_poscar = True                
+
+            #neb
+            if 'neb' in self.calc_method: 
+                if write: 
+                    f.write("#NEB run, start and final configurations, then IMAGES:\n") 
+                update_incar(parameter = 'IMAGES', value = 0, write = write) # start and final runs
+
+            
+            if 0: #experimental preliminary non-magnetic run
+                ''
+                #     if self.set.vasp_params['ISPIN'] == 2:
+                #         print_and_log('Magnetic calculation detected; For better convergence',
+                #          'I add first non-magnetic run', imp = 'Y')
+                #         write = True
+                #         name_mod_last = '.'+'NM'
+                #         name_mod = '.NM'
+
+                #         if write: 
+                #             f.write("#Preliminary non-magnetic run:\n")  
+                #         prepare_input(prevcalcver = prevcalcver, option = option,
+                #          input_geofile = input_geofile, name_mod_prev = name_mod_last, write = write, curver = version)
+
+                #         update_incar(parameter = 'ISPIN', value = 1, write = write) #
+                        
+                #         run_command(option = option, name = self.name+name_mod, parrallel_run_command = parrallel_run_command, write = write)
+
+                #         if write:
+                #             f.write("cp CONTCAR POSCAR  #prepare for basic run\n")
+                #             write_poscar = False  
+
+                #         mv_files_according_versions('co', v, name_mod = name_mod, write = write, rm_chg_wav = '')
+
+                #         update_incar(parameter = 'ISPIN', value = 2, write = write) #
+
+
+
+
+            if 'u_ramping' in self.calc_method:
+
+                if write: 
+                    f.write("#U-ramping run:\n")  
+
+                # name_mod_last = '.'+name_mod_U_last()
+                name_mod_last = '.U00' #since u_ramp starts from u = 00, it is more correct to continue from 00
+                if penult_set_name:
+                    name_mod_last += '.'+penult_set_name #however, for multiset run, the structure for u=00 exists only
+                                                      #for penult set or maybe even for the first only set
+                    # print (name_mod_last, penult_set_name)
+                    # sys.exit()
+                    
+                # print 'prevcalver', prevcalcver
+
+                if write and copy_poscar_flag: 
+                    f.write("rm CHGCAR    #u-ramp init from scratch\n")                
+
+                prepare_input(prevcalcver = prevcalcver, option = option,
+                 input_geofile = input_geofile, name_mod_prev = name_mod_last, write = write_poscar, curver = version,
+                 copy_poscar_flag = copy_poscar_flag)
+
+                if copy_poscar_flag:
+                    usteps = range(self.set.u_ramping_nstep)
+                else:
+                    usteps = [self.set.u_ramping_nstep-1]  # now it the case of sequence_set for contin sets only the last U is used
+
+                u_last = 100
+                for i_u in usteps:
+
+                    u = update_incar(parameter = 'LDAUU', u_ramp_step = i_u, write = write)
+                    if u == u_last:
+                        continue
+                    name_mod   = '.U'+str(u).replace('.', '')+set_mod
+                   
+                    run_command(option = option, name = self.name+name_mod, parrallel_run_command = parrallel_run_command, write = write)
+
+                    if write: 
+                        if copy_poscar_flag:
+
+                            f.write("cp CONTCAR POSCAR   #u-ramp preparation\n")                
+
+            # print(savefile)
+                    contcar_file = mv_files_according_versions(savefile, v, name_mod = name_mod, write = write, rm_chg_wav = '')
+                
+
+
+                    self.associated_outcars.append( v + name_mod +  ".OUTCAR"  )
+                    u_last = u
+                
+                if final_analysis_flag:
+                    rm_chg_wav = 'w' #The wavcar is removed for the sake of harddrive space
+                
+                else:
+                    rm_chg_wav = ''
+
+                if curset.save_last_wave:
+                    save_last = 'cw'
+                else:
+                    save_last = 'c'
+
+
+                mv_files_according_versions(savefile = save_last, v=v, name_mod = name_mod, rm_chg_wav = rm_chg_wav) #save more files for last U
+                
+
+                analysis_script(write = write)
+                # print self.associated
+
+
+
+
+
+            elif 'afm_ordering' in self.calc_method:
+
+                #Comment - inherit_xred option is not available here
+                f.write("rm CHGCAR\n")                
+                if not savefile: 
+                    savefile = 'o'
+
+                for i, magmom in enumerate(self.magnetic_orderings):
+
+                    name_mod   = '.AFM'+str(i)+set_mod
+
+                    update_incar(parameter = 'MAGMOM', value = magmom)
+
+                    prepare_input(prevcalcver = prevcalcver, option = option, input_geofile = input_geofile,
+                        copy_poscar_flag = copy_poscar_flag)
+                    
+                    run_command(option = option, name = self.name+name_mod, parrallel_run_command = parrallel_run_command)
+
+                    contcar_file = mv_files_according_versions(savefile, v, name_mod = name_mod)
+                
+                    self.associated_outcars.append( v + name_mod +  ".OUTCAR"  )
+
+                analysis_script()
+            
+
+            else: #simple run
+                
+                if not savefile: 
+                    savefile = 'vco'
+
+                if write: 
+                        f.write("#Basic run:\n")  
+
+                name_mod   = set_mod
+                name_mod_last = ''
+
+                prepare_input(prevcalcver = prevcalcver, option = option, name_mod_prev = name_mod_last,
+                    input_geofile = input_geofile, write = write_poscar, curver = version,
+                    copy_poscar_flag = copy_poscar_flag)
+
+                run_command(option = option, name = self.name+name_mod, parrallel_run_command = parrallel_run_command, write = write)
+
+                if final_analysis_flag:
+                    rm_chg_wav = 'w' #The wavcar is removed for the sake of harddrive space
+                
+                else:
+                    rm_chg_wav = ''
+
+
+                contcar_file = mv_files_according_versions(savefile, v, write = write, name_mod = name_mod, rm_chg_wav = rm_chg_wav)
+
+                self.associated_outcars.append( v + name_mod +  ".OUTCAR"  )
+
+            return contcar_file
+        
+
+
+        def write_footer(set_mod = '', run_tool_flag = True, savefile = None, final_analysis_flag = True):
+            """footer"""
+            
+            def u_ramp_prepare():
+                if 'u_ramping' in self.calc_method:
+                    u = update_incar(parameter = 'LDAUU', u_ramp_step = self.set.u_ramping_nstep-1, write = False)
+                    name_mod   = '.U'+str(u).replace('.', '')
+                    # name_mod_last = name_mod_U_last()+'.'
+                    name_mod_last = '.'+'U00' #since u_ramp starts from u = 00, it is more correct to continue from 00
+                
+                else:
+                    name_mod_last = ''
+                    name_mod   = ''                
+
+                return name_mod, name_mod_last
+
+            def u_ramp_loop(ver_prefix = '', subfolders = None, run_name_prefix = None, set_mod = ''):
+
+                if not subfolders:
+                    subfolders = ['.']
+
+                
+
+                if run_tool_flag:
+                    usteps = range(self.set.u_ramping_nstep)
+                else:
+                    usteps = [self.set.u_ramping_nstep-1]  # now it the case of sequence_set for contin sets only the last U is used
+
+
+                u_last = 100
+
+                for i_u in usteps:
+
+
+                    u = update_incar(parameter = 'LDAUU', u_ramp_step = i_u)
+                    if u == u_last:
+                        continue
+
+                    name_mod   = ver_prefix+'U'+str(u).replace('.', '')+set_mod
+
+                    
+                    run_command(option = option, name = run_name_prefix+'.'+name_mod, 
+                        parrallel_run_command = parrallel_run_command, write = True)
+                    
+                    u_last = u
+
+
+                    for n_st in subfolders:
+
+                        f.write('cp '+n_st+'/CONTCAR '+n_st+'/POSCAR'+'               #u_ramp_loop()\n' )
+                        f.write('cp '+n_st+'/OUTCAR  '+n_st+'/'+name_mod+'.OUTCAR'+'  #u_ramp_loop()\n' )
+                        contcar = name_mod+'.CONTCAR'
+                        f.write('cp '+n_st+'/CONTCAR  '+n_st+'/'+contcar+'            #u_ramp_loop()\n' )
+
+                        # self.associated_outcars.append( v + name_mod +  ".OUTCAR"  )
+
+
+                return contcar
+
+            subfolders = None
+            contcar_file = None
+            
+            if neb_flag:
+                print_and_log('Writing scripts for NEB method', important = 'n')
+                nim = self.set.vasp_params['IMAGES']
+                nim_str = str(nim)
+
+                subfolders = []
+                for n in range(1, nim+1):
+                    if n < 10:
+                        n_st = '0'+str(n)
+                    elif n < 100:
+                        n_st = str(n)
+                    subfolders.append(n_st)
+
+
+                name_mod, name_mod_last = u_ramp_prepare()
+
+
+                start = '1'+name_mod+'.OUTCAR '
+                final = '2'+name_mod+'.OUTCAR '
+
+
+
+                f.write("\n\n#Starting NEB script \n")
+
+                if option and 'continue' in option:
+                    prevout = name_mod_last+'OUTCAR '
+
+                    for n_st in subfolders:
+                        f.write('cp '+n_st+'/'+prevout+n_st+'/'+'prev.'+prevout+'  # inherit_option = continue\n' )
+                        f.write('cp '+n_st+'/CONTCAR '+n_st+'/POSCAR  # inherit_option = continue\n')
+                        f.write('mv '+n_st+'/CHGCAR '+n_st+'/prev.CHGCAR   # inherit_option = continue\n')
+
+                else:
+                    
+                    if run_tool_flag:
+                        f.write('export PATH=$PATH:'+header.cluster_home+'/tools/vts/\n') #header.project_path_cluster
+
+                        f.write('nebmake.pl '+ start.replace('OUT','CONT') + final.replace('OUT','CONT') + nim_str +' \n')
+
+
+                if nim+1 < 10: 
+                    nim_plus_one_str = '0'+str(nim+1)
+
+                if run_tool_flag:
+                    f.write('cp '+start +  '00/OUTCAR\n')
+                    f.write('cp '+final +  nim_plus_one_str + '/OUTCAR\n' )
+
+
+                update_incar(parameter = 'IMAGES', value = nim)
+
+
+                if 'u_ramping' in self.calc_method:
+
+
+                    contcar_file = u_ramp_loop(subfolders = subfolders, 
+                        run_name_prefix = self.name+'.n_'+nim_str, 
+                        set_mod = set_mod)
+              
+
+                else:
+
+                    run_command(option = option, name = self.name+set_mod+'.n_'+nim_str+name_mod, 
+                    parrallel_run_command = parrallel_run_command, write = True)
+                    # print(set_mod)
+                    # sys.exit()
+                    if '.' in set_mod and set_mod[0] == '.':
+                        set_mod_loc = set_mod[1:]
+                    else:
+                        set_mod_loc = set_mod
+
+                    name_mod   = set_mod_loc
+                    if name_mod:
+                        contcar = name_mod+'.CONTCAR'
+                        outcar  = name_mod+'.OUTCAR'
+                        for n_st in subfolders:
+                            f.write('cp '+n_st+'/OUTCAR  '+n_st+'/'+outcar  +'  #sequence set: save file\n' )
+                            f.write('cp '+n_st+'/CONTCAR  '+n_st+'/'+contcar+'  #sequence set: save file\n' )
+                    else:
+                        contcar = 'CONTCAR'
+
+                    contcar_file = contcar
+
+
+
+
+
+
+                if final_analysis_flag:
+                    f.write('export PATH=$PATH:'+header.cluster_home+'/tools/gnuplot/bin/ \n')
+                    f.write(header.cluster_home+'/tools/vts/nebresults.pl  \n')
+                    f.write('find . -name WAVECAR -delete\n')
+                    f.write('find . -name PROCAR -delete\n')
+                # for n in range
+
+
+
+            # print (calc[id].calc_method )
+            # sys.exit()
+            if 'uniform_scale' in self.calc_method:
+                # print (input_geofile)
+                name_mod = set_mod
+                
+                if run_tool_flag:
+                    f.write("\n\n#Starting fitting tool \n")
+                    outputs = [ os.path.basename(out) for out in output_files_names ]
+                    # f.write('export PYTHONPATH=$PYTHONPATH:'+CLUSTER_PYTHONPATH+'\n')
+                    # f.write('/home/aksenov/tools/fit_tool.py '+list2string(outputs)+'\n' )
+                    f.write('python '+header.cluster_home+'/tools/fit_tool.py '+list2string(outputs)+'\n' )
+                    
+
+                    f.write('cp 100.POSCAR POSCAR \n')
+                
+                if 'u_ramping' in self.calc_method:
+                    
+
+                    contcar_file = u_ramp_loop(ver_prefix = '100.', run_name_prefix = self.id[0]+'.fitted', set_mod = set_mod)
+
+                else:
+                    if final_analysis_flag:
+                        rm_chg_wav = 'w' #The wavcar is removed for the sake of harddrive space
+                    
+                    else:
+                        rm_chg_wav = ''
+
+
+
+
+                    run_command(option = option, name = self.id[0]+'.'+self.id[1]+'.100'+name_mod+'.fitted', 
+                        parrallel_run_command = parrallel_run_command, write = True)
+
+                    # print(final_analysis_flag)
+                    # sys.exit()
+
+                    contcar_file = mv_files_according_versions(savefile, '100', name_mod = name_mod, write = True, rm_chg_wav = rm_chg_wav)
+
+                # sys.exit()
+
+
+            #clean at the end
+            if final_analysis_flag: 
+                if header.final_vasp_clean:
+                    f.write('rm PROCAR DOSCAR OSZICAR PCDAT REPORT XDATCAR vasprun.xml\n')
+                f.write('rm RUNNING\n')
+
+
+
+            return contcar_file, subfolders
+
+
+
+
+        nsets = len(sets)
+        footer_flag = not set(self.calc_method).isdisjoint(['uniform_scale', 'neb', 'only_neb' ])
+
+
+
+
+        if mode == "body": #control part of script
+            self.associated_outcars = []
+
+        penult_set_name = None
+
+        for k, curset in enumerate(sets):
+            
+            if nsets > 1: #the incar name is modified during creation only if more than 1 set is detected
+                if mode == 'body' or footer_flag:
+                    f.write('\n#sequence set: '+curset.ise+' \n')
+                    f.write('cp '+curset.ise+'.INCAR  INCAR\n')
+                    if hasattr(curset, 'savefile') and len(curset.savefile) > 0:
+                        savefile = curset.savefile 
+
+
+                penult_set_name = sets[-2].ise
+            
+
+            if k < nsets-1:
+                set_mod = '.'+curset.ise
+                final_analysis_flag = False
+            else: #last set
+                set_mod = '' # the last step do no use modifications of names 
+                final_analysis_flag = True #for footer
+
+
+
+            if k == 0: # additional control of prepare_input routine and footer
+                copy_poscar_flag = True # the flag is also used to detect first set
+                run_tool_flag = True
+            else:
+                copy_poscar_flag = False
+                run_tool_flag  = False
+
+            if mode == "body":
+                
+                contcar_file = write_body( v = str(version), savefile = savefile, 
+                    set_mod = set_mod, copy_poscar_flag = copy_poscar_flag, 
+                    final_analysis_flag = final_analysis_flag, penult_set_name = penult_set_name, curset = curset)
+
+                
+
+            elif mode == 'footer':
+                if copy_poscar_flag: 
+                    f.write('\n#Footer section: \n')
+
+
+                # print(savefile)
+                # sys.exit()
+                contcar_file, subfolders = write_footer(set_mod = set_mod, run_tool_flag = run_tool_flag, savefile = savefile,
+                 final_analysis_flag = final_analysis_flag)
+
+            
+            if k < nsets-1 and contcar_file:
+                if 'o' in savefile:
+                    if neb_flag and mode == 'footer':
+                        for n_st in subfolders:
+                            f.write('cp '+n_st+'/'+contcar_file+' '+n_st+'/POSCAR  # sequence_set: preparation of input geo for next neb set\n' )
+                    else:
+                        f.write('cp '+contcar_file+' POSCAR  #sequence_set: preparation of input geo for next set\n')
+
+
+
+
+
+
+
+
+
+
+        if hasattr(self, 'associated_outcars') and  self.associated_outcars:
+            out = self.associated_outcars[-1]
+        else:
+            out = None
+        # print 'write_sge() out=', out
+        f.close()
+        
+        return  out#return OUTCAR name
+    
+
+
+
+    def make_run(self, schedule_system, run_name):
+        """Generate run file
+
+        INPUT:
+            schedule_system - 
+        """
+
+        with open('run','a', newline = '') as f:
+
+            if schedule_system == 'SGE':
                 #'qsub -pe 'mpi*' NCORES -l CLUSTER_TAG script.parallel.sh' for mpi-jobs which should run on CLUSTER_TAG (cmmd or cmdft)
                 #IMPORTANT: NCORES must be a multiple of 8(24) on cmdft(cmmd). 
                 f.write("qsub -pe 'mpi*' "+str(header.corenum)+" "+header.queue+" "+run_name+"\n") #str(self.set.np) #-l cmmd
                 f.write('sleep 5\n')
                 # runBash('chmod +x run')
-            if type == 'PBS':
-                f.write("cd "+self.dir+"\n")
-                f.write("qsub "+self.id[0]+"."+self.id[1]+'.run'+"\n") #str(self.set.np) #-l cmmd
+            elif schedule_system in ['PBS', 'PBS_bsu']:
+                if header.PATH2PROJECT == '':
+                    header.PATH2PROJECT = '.'
+
+                f.write("cd "+header.PATH2PROJECT+'/'+self.dir+"\n")
+                f.write("qsub "+run_name.split('/')[-1]+"\n") 
                 f.write("cd -\n")
                 f.write('sleep 5\n')                        
+            
+            elif schedule_system == 'SLURM':
+                f.write("squeue\n") 
+                f.write("sbatch -p AMG " + run_name+"\n") 
+            else:
+                printlog('Error! Unknown schedule_system', schedule_system)
+                
 
-        self.state = "3. Ready for start"
-        log.write("\nRun file created\n")     
+
+
+        printlog("\nRun file created\n")     
         return
 
 
 
-    def calc_kspacings(self,ngkpt = []):
+    def calc_kspacings(self, ngkpt = None, sttype = 'init'):
         """Calculates reciprocal vectors and kspacing from ngkpt"""
-        to_ang_local = to_ang
-        try:
-            if "Ang" in self.len_units:
-                to_ang_local = 1
-                #print "units angs"
-        except AttributeError:
-            print_and_log("Warning! no len_units for "+self.name+" calculation, I use Bohr \n")
-        #Determine reciprocal vectors
-        if 1: #Already calculated during reading of structure
-            self.recip = []
-            vol = np.dot( self.init.rprimd[0], np.cross(self.init.rprimd[1], self.init.rprimd[2])  ); #volume
-            #print vol
-            self.recip.append(   np.cross( self.init.rprimd[1], self.init.rprimd[2] )   )
-            self.recip.append(   np.cross( self.init.rprimd[2], self.init.rprimd[0] )   )
-            self.recip.append(   np.cross( self.init.rprimd[0], self.init.rprimd[1] )   )
-            for i in 0,1,2:
-                self.recip[i] =  self.recip[i] * 2 * math.pi / vol;
-        #print self.recip
+        # to_ang_local = header.to_ang
+        # try:
+        #     if "Ang" in self.len_units:
+        #         to_ang_local = 1
+        #         #print "units angs"
+        # except AttributeError:
+        #     print_and_log("Warning! no len_units for "+self.name+" calculation, I use Bohr \n")
+        
+
+        if sttype == 'init':
+            st = self.init
+        if sttype == 'end':
+            st = self.end 
+
+
         self.kspacing = []
+        st.kspacings = []
+
         if not ngkpt:
             ngkpt = self.set.ngkpt
+
         k = [0,0,0]
+
         if ngkpt:
-            # print 'ngkpt are ', ngkpt
-            # print 'recip are', self.recip
-            for i in 0, 1, 2:
-                a = np.linalg.norm( self.recip[i] ) / ngkpt[i] / to_ang_local
-                self.kspacing.append(red_prec(a))
-            k = self.kspacing
-        #print "Spacings for %s is [%.2f, %.2f, %.2f]"%(self.set.ngkpt,k[0], k[1], k[2])
+            k = calc_kspacings(ngkpt, st.rprimd)
+            self.kspacing = copy.deepcopy(k)
+            st.kspacing   = copy.deepcopy(k)
+
         return  k
 
-    def read_results(self, load = 0, out_type = '', voronoi = False, show = [] ):
 
-        #Start to read OUTCAR
-        # print self.version, 'version'
-        path_to_outcar  = self.path["output"]
-        path_to_contcar = self.dir+str(self.version)+".CONTCAR"
-        path_to_xml = self.dir+str(self.version)+".vasprun.xml"
 
-        # print self.version, type(self.version)
-        # print path_to_outcar, path_to_contcar
 
-        # print os.path.exists(path_to_contcar)
-        contcar_exist   = False
- 
-        self.natom = self.init.natom
 
-        """Copy from server """
-        if load == 1:
-            # print "rsync -ave ssh "+cluster_address+":"+project_path_cluster+path_to_outcar+" "+self.dir
-            log.write( runBash("rsync -zave ssh "+cluster_address+":"+project_path_cluster+path_to_outcar+" "+self.dir)+'\n' ) #OUTCAR
-            log.write( runBash("rsync -zave ssh "+cluster_address+":"+project_path_cluster+path_to_contcar+" "+self.dir)+'\n' ) #CONTCAR
-            log.write( runBash("rsync -zave ssh "+cluster_address+":"+project_path_cluster+path_to_xml+" "+self.dir)+'\n' ) #CONTCAR
+
+
+
+
+
+
+
+
+    def read_results(self, load = '', out_type = '', voronoi = False, show = '', choose_outcar = None, alkali_ion_number = None, only_load = False):
+
+        """
+        Download and Read VASP OUTCAR file
+
+        ###INPUT:
+            - load (str) - 'x' - download xml, o - download outcar and contcar, un - read unfinished
+            - show (str) - print additional information
+            - choose_outcar - see description in res_loop(), from 1
+            - out_type - controls the return string
+                see in code, add here
+                also controls reading of OUTCAR
+                'xcarts' read xcart every relaxation step and write into self.end.list_xcart
+
+            - only_load (bool) - if true - only load the files (used for database)
+
+        ###RETURN:
+            ?
+
+        ###DEPENDS:
+        TODO:
+        please split into outcar parser, downloader, and checker-formatter
+
+        """
+
+        # print (choose_outcar, hasattr(self, 'associated_outcars'), self.associated_outcars)
+        join = os.path.join
+        dirname = os.path.dirname
+
+        if header.show:
+            show +=header.show
+
+        if not hasattr(self, 'dir'):
+            self.dir = os.path.dirname(self.path['output'])
+
+
+        if choose_outcar and hasattr(self, 'associated_outcars') and self.associated_outcars and len(self.associated_outcars) >= choose_outcar:
+            # print ('associated outcars = ',self.associated_outcars)
+            printlog('read_results(): choose_outcar', choose_outcar)
+
+            path_to_outcar = join( dirname(self.path["output"]), self.associated_outcars[choose_outcar-1] )
+
+            printlog(self.associated_outcars)
+        else:
+            path_to_outcar  = self.path["output"]
+        
+
+        if 'OUTCAR' in path_to_outcar:
+            path_to_contcar = path_to_outcar.replace('OUTCAR', "CONTCAR")
+            path_to_poscar = path_to_outcar.replace('OUTCAR', "POSCAR")
+            path_to_xml     = path_to_outcar.replace('OUTCAR', "vasprun.xml")
+        else:
+            path_to_contcar = ''
+            path_to_xml     = ''
+
+
+        if self.calc_method  and not set(self.calc_method  ).isdisjoint(  ['u_ramping', 'afm_ordering']):
+            '' 
+            # print self.associated_outcars
+            # lor = self.associated_outcars[-1]
+            # path_to_outcar  = self.dir + lor
+            # path_to_contcar = self.dir + lor.replace('OUTCAR', 'CONTCAR')
+            # path_to_xml     = self.dir + lor.replace('OUTCAR', 'vasprun.xml')         
+            # print 'sdf', path_to_outcar, path_to_contcar, path_to_xml
+
+            # energies_str = runBash("ssh "+self.cluster_address+" cat "+self.dir+"ENERGIES")
             
-            if not os.path.exists(path_to_outcar): 
-                print_and_log("\nNo OUTCAR file even on server; Continue... \n")
-                """Calculate voronoi volume"""
-                # print hasattr(self, 'vorovol')
-                if voronoi:# and not hasattr(self, 'vorovol'):#out_type == 'e_seg':
-                    calculate_voronoi(self)
-                return
-                # raise RuntimeError
+            # print "ssh "+self.cluster_address+" cat "+self.dir+"ENERGIES"
+            # print (  energies_str )
+            # if not 'cat' in energies_str:
+            #     self.associated_energies = [float(e) for e in energies_str.split()]
+            
+            # self.u_ramping_u_values = np.arange(*self.u_ramping_list)
+            # print 'associated_energies:', self.associated_energies
+        print_and_log('read_results() path to outcar', path_to_outcar)
+        # sys.exit()
 
-        if not os.path.exists(path_to_outcar) and self.id[2] == 1:
-            path_to_outcar = self.dir+"OUTCAR" # For compability only for version 1
-            if load == 1:
-                log.write( runBash("rsync -zave ssh "+cluster_address+":"+project_path_cluster+path_to_outcar+" "+self.dir)+'\n' )
-            log.write("Warning! I have used OUTCAR instead of 1.OUTCAR\n")
 
 
         if not os.path.exists(path_to_outcar):
-            print_and_log("\nNo OUTCAR file... \n")
-            raise RuntimeError
+            load = load+'o'
+
+
+
+
+        """Copy from server """
+
+        printlog('The load flag is ', load)
+
+        if 'o' in load:
+
+            #reduce size of downloadable file by removing occupations: vasp 4 and 5
+            command_reduce = """ssh {0:s} nbands=\`grep \\"NBANDS=\\" \{1:s} \| awk \\'{{print \$NF - 1}}\\'\`\; sed -i -e \\"/band No./,+\${{nbands}}d\\" \{1:s} """.format(
+                self.cluster_address, join(self.project_path_cluster, path_to_outcar) )
+            # runBash(command_reduce)
+
+
+            if 'un2' in load:
+                out_name  = os.path.basename(path_to_outcar)
+                cont_name = os.path.basename(path_to_contcar)
+                path_to_outcar = path_to_outcar.replace(out_name, 'OUTCAR')
+                path_to_contcar = path_to_contcar.replace(cont_name, 'CONTCAR')
+
+
+            files = [ self.project_path_cluster+'/'+path_to_outcar, self.project_path_cluster+'/'+path_to_contcar ]
+            # print(load)
+            # print(files)
+            # get_from_server(files = files, to = os.path.dirname(path_to_outcar),  addr = self.cluster_address)
+            for file in files:
+                self.get_file(os.path.basename(file), up = load)
+
+
+        if 'x' in load:
+
+            # get_from_server(files = join(self.project_path_cluster, path_to_xml), to = os.path.dirname(path_to_outcar),  
+            #     addr = self.cluster_address)
+            
+            self.get_file(os.path.basename(path_to_xml), up = load)
+
+
+
 
         if os.path.exists(path_to_contcar):
             contcar_exist   = True
+        else:
+            contcar_exist   = False
 
 
-
+        if os.path.exists(path_to_outcar):
+            outcar_exist   = True
+        else:
+            outcar_exist   = False
+            path_to_zip = path_to_outcar+'.gz'
+            if os.path.exists(path_to_zip):
+                with gzip.open(path_to_zip, 'rb') as f_in:      # unzip OUTCAR
+                    with open(path_to_outcar, 'wb') as f_out:
+                        shutil.copyfileobj(f_in, f_out)
+                if os.path.exists(path_to_outcar):
+                    outcar_exist = True
 
 
         """Start reading """
-        s = runBash("grep 'General timing' "+path_to_outcar)
-        if "g" in s:
-            #print s
-            self.state = "4. Calculation completed."
-        else: self.state = "3. Partly completed!."
-        # print self.state
+        if outcar_exist:
+
+            out = grep_file('General timing', path_to_outcar, reverse = True)
+
+            printlog('The grep result of',path_to_outcar, 'is:', out)
+            # sys.exit()
+            if 'Gen' in out or 'un' in load:
+                self.state = '4. Finished'
+            else:
+                self.state = '5. Broken outcar'
+
+
+
+        else:
+            self.state = '5. no OUTCAR'
+        
+        outst = self.state
+
+
         if "4" in self.state:
+            
+            read = 1
+            if read:
+                if 0: #please use this only for linux or create cross-platform way
+                    nw = runBash('sed -n "/NPAR = approx SQRT( number of cores)/=" '+path_to_outcar) #remove warinig
+                    tmp = path_to_outcar+".tmp"
+                    if nw:
+                        nw = int(nw)
+                        runBash("sed '"+str(nw-11)+","+str(nw+8)+"d' "+path_to_outcar+">"+tmp+";mv "+tmp+" "+path_to_outcar)
 
-            #war = runBash('grep "NPAR = approx SQRT( number of cores)" '+path_to_outcar) #remove warinig
-            nw = runBash('sed -n "/NPAR = approx SQRT( number of cores)/=" '+path_to_outcar) #remove warinig
-                    # print runBash("sed '/from  /, /to  /d' "+path_to_outcar)
-                    #print "sed -e '15,34d' "+path_to_outcar
-            #print 'grep "NPAR = approx SQRT( number of cores)" '+path_to_outcar
-            #print nw
-            tmp = path_to_outcar+".tmp"
-            if nw:
-                nw = int(nw)
-                #print "sed '"+str(nw-11)+","+str(nw+8)+"d' "+path_to_outcar+">"+tmp+";mv "+tmp+" "+path_to_outcar
-                runBash("sed '"+str(nw-11)+","+str(nw+8)+"d' "+path_to_outcar+">"+tmp+";mv "+tmp+" "+path_to_outcar)
-                pass
 
-            with open(path_to_outcar, 'r') as outcar:
-                log.write("Start reading from "+ path_to_outcar+" \n")
-                outcarlines = outcar.readlines()
-
-            re_lengths = re.compile("length of vectors")
-            re_eltime = re.compile("Elapsed time")
-            re_nkpts = re.compile("NKPTS")
-
-            i_line = 0
-            iterat = 0
-            self.mdstep = 1
-            warnings = 0#""
-            self.time = 0
-            nscflist = [] ; mdstep_old = 1; niter_old = 0
-            maxforce = []; average = [];  gstress =[]
-            self.list_e_sigma0 = []
-            self.list_e_without_entr = []
-            try:
-                self.end = copy.deepcopy(self.init) # below needed end values will be updated
-            except:
-                self.end = Structure()
-
-            if not hasattr(self.end, "natom"): self.end.natom = self.natom
-            #Structure() #create structure object with end values after calculation
-            #self.end.typat = self.typat
-            #self.end.znucl = self.znucl
-            self.end.name = self.name+'.end'
-            self.end.list_xcart = []
-            self.energy = empty_struct()
-
-            nsgroup = 1
-            magnitudes = []
-            # print self.set.vasp_params
-
-            for line in outcarlines:
-
-                #Check bands
-
-                # if 'band No.' in line:
-                #     kpoint = float(outcarlines[i_line-1].split()[1])
-                #     lastocc = float(outcarlines[i_line+self.nbands].split()[2])
-                #     lastbandno = outcarlines[i_line+self.nbands].split()[0]
-                #     if lastocc > 0:
-                #         print "Warning!!! at kpoint ", kpoint, " last band No. ",lastbandno, " is not empty ", lastocc
+                with open(path_to_outcar, 'r') as outcar:
+                    
+                    printlog("Start reading from "+ path_to_outcar, imp = 'n')
+                    outcarlines = outcar.readlines()
 
 
 
 
+                re_lengths = re.compile("length of vectors")
+                re_eltime = re.compile("Elapsed time")
+                re_nkpts = re.compile("NKPTS")
+                iterat = 0
+                i_line = 0
+                mdstep_prev = 0
+                dipol = None
+                self.mdstep = 1
+                warnings = 0#""
+                self.time = 0
+                nscflist = []; mdstep_old = 1; niter_old = 0
+                maxforce = []; average = [];  gstress =[]
+                # mforce = []
+                self.list_e_sigma0 = []
+                self.list_e_without_entr = []
+                try:
+                    self.end = copy.deepcopy(self.init) # below needed end values will be updated
+                except:
+                    self.end = Structure()
 
-                #Check W(q)
-                if 'operators is LMAX' in line:
-                    lmax = int(line.split()[7])
-                if "W(low)/X(q)" in line:
-                    low = [ float(outcarlines[i].split()[4]) for i in range(i_line+1, i_line+lmax+1)]
-                    high = [ float(outcarlines[i].split()[5]) for i in range(i_line+1, i_line+lmax+1)]
-                    if any(v > 1e-3 for v in low+high):
-                        print_and_log("W(q)/X(q) are too high, check output!\n")
+                # if not hasattr(self.end, "natom"): 
+                #     self.end.natom = self.natom
+                #Structure() #create structure object with end values after calculation
+                #self.end.typat = self.typat
+                #self.end.znucl = self.znucl
+                self.end.name = self.name+'.end'
+                self.end.list_xcart = []
+                self.energy = empty_struct()
 
-                if "direct lattice vectors" in line:
-                    for v in 0,1,2:
-                        self.end.rprimd[v] = np.asarray( [float(ri) for ri in outcarlines[i_line+1+v].split()[0:3]   ] )
-                    #print self.end.rprimd
-                    #print self.rprimd
-                if "POSITION" in line:
-                    if not contcar_exist or out_type == 'dimer':
-                        self.end.xcart = [] #clean xcart before filling
-                        for i in range(self.init.natom):
-                            #print outcarlines[i_line+1+i].split()[0:3] 
-                            xcart = np.asarray ( 
-                                        [   float(x) for x in outcarlines[i_line+2+i].split()[0:3]   ] 
-                                    )
-                            
-                            self.end.xcart.append( xcart )
-                            #self.end.xred.append ( xcart2xred( xcart, self.end.rprimd) )
-                        if out_type == 'dimer':
-                            self.end.list_xcart.append(self.end.xcart) #xcart at each step only for dimer
-
-
-
-
-                if "TOTAL-FORCE" in line:
-                    # Calculate forces here...
-                    forces = []
-                    magnitudes = []
-                    for j in range(0,self.init.natom):
-                        parts = outcarlines[i_line+j+2].split()
-                        x = float(parts[3])
-                        y = float(parts[4])
-                        z = float(parts[5])
-                        forces.append([x,y,z])
-                        magnitudes.append(math.sqrt(x*x + y*y + z*z))
-                    average.append( red_prec( sum(magnitudes)/self.init.natom * 1000 ) )
-                    imax = np.asarray(magnitudes).argmax()
-                    maxforce.append( [imax, round(magnitudes[imax] * 1000)]  )
-
-                #Check total drift
-                if "total drift:" in line:
-                    #print line
-                    tdrift = [float(d) for d in line.split()[2:5]]
-                    #if any(d > 0.001 and d > max(magnitudes) for d in tdrift):
-                        #print_and_log("Total drift is too high = "+str(tdrift)+", check output!\n")
-                        #pass
+                de_each_md = 0 # to control convergence each md step
+                de_each_md_list = []
 
 
-                if "g(Stress)" in line:
-                    #print line
-                    gstress.append( round( float(line.split()[4])*1000 *100, 3 )  )
-                #if "Total" in line:
-                    #gstress.append( red_prec(float(line.split()[4])*1000 *100, 1000 )  )
-                if "volume of cell" in line:
-                    try:                     self.end.vol = float(line.split()[4])
-                    except ValueError: print_and_log("Warning! Cant read volume in calc "+self.name+"\n")
-                    #print self.vol      
+                nsgroup = None
+                magnitudes = []
+                self.mag_sum = [] #toatal mag summed by atoms, +augmentation
 
-                if "generate k-points for:" in line: 
-                    self.set.ngkpt = tuple(  [int(n) for n in line.split()[3:]]  )
-                    #print self.set.ngkpt
+                tot_mag_by_atoms = [] #magnetic moments by atoms on each step
+                tot_chg_by_atoms = []
+                tot_mag_by_mag_atoms = []
+
+
+                ldauu = None
+                e_sig0 = 0 #energy sigma 0 every scf iteration
+                occ_matrices = {} # the number of atom is the key
+
+                #which kind of forces to use
+                if ' CHAIN + TOTAL  (eV/Angst)\n' in outcarlines:
+                    force_keyword = 'CHAIN + TOTAL  (eV/Angst)'
+                    ff  = (0, 1, 2)
+                    force_prefix = ' chain+tot '
+
+                else:
+                    force_keyword = 'TOTAL-FORCE'
+                    ff  = (3, 4, 5)
+                    force_prefix = ' tot '
 
 
 
-
-  # alpha Z        PSCENC =       490.96968543
-  # Ewald energy   TEWEN  =     -9607.95993345
-  # -1/2 Hartree   DENC   =     -3050.68217759
-  # -exchange  EXHF       =         0.00000000
-  # -V(xc)+E(xc)   XCENC  =       516.30683760
-  # PAW double counting   =     10207.08402417   -10005.81713472
-  # entropy T*S    EENTRO =         0.00000000
-  # eigenvalues    EBANDS =     -1760.14896244
-  # atomic energy  EATOM  =     13136.98513889
-                  # Kohn-Sham hamiltonian: http://en.wikipedia.org/wiki/Kohn%E2%80%93Sham_equations
-                  #kinetic energy
-                  #+ the external potential + the exchange-correlation energy +
-                  #+ Hartree (or Coulomb) energy
-                if  "alpha Z        PSCENC" in line:
-                    self.energy.alpha = float(line.split()[-1]) # the electrostatic interaction of the ions in a compensating electron gas.
-
-                if  "Ewald energy   TEWEN" in line:
-                    self.energy.ewald = float(line.split()[-1]) # the electrostatic interaction of the ions in a compensating electron gas.
-                    # print self.energy.ewald
-                if  "-1/2 Hartree   DENC" in line:
-                    self.energy.hartree = float(line.split()[-1]) #Coulomb electron-electron energy
-                    # print self.energy.hartree
-                if  "-V(xc)+E(xc)   XCENC" in line:
-                    self.energy.xc = float(line.split()[-1]) # Kohn-Sham exchange-correlation energy
-                if  "PAW double counting" in line:
-                    self.energy.pawdc1 = float(line.split()[-2]) #
-                    self.energy.pawdc2 = float(line.split()[-1]) #
-                if  "eigenvalues    EBANDS" in line:
-                    self.energy.bands = float(line.split()[-1]) # - Kohn Sham eigenvalues - include kinetic energy , but not exactly
-                if  "atomic energy  EATOM" in line:
-                    self.energy.atomic = float(line.split()[-1]) #energy of atoms in the box
+                # try:
+                #     spin_polarized = self.set.spin_polarized # again it will be better to determine this from outcar 
+                # except:
+                #     spin_polarized = None
 
 
 
-                if "energy  without entropy=" in line:
-                    #self.energy = float(line.split()[4])
-                    self.e_without_entr = float(line.split()[3]) #energy(sigma->0)
-                    self.energy_sigma0 = float(line.split()[6]) #energy(sigma->0)
-                    self.list_e_sigma0.append(  self.energy_sigma0  )
-                    self.list_e_without_entr.append(  self.e_without_entr  )
+                self.potcar_lines = []
+                self.stress = None
+                self.intstress = None
+                spin_polarized = None
+                for line in outcarlines:
+
+                    #Check bands
+
+                    # if 'band No.' in line:
+                    #     kpoint = float(outcarlines[i_line-1].split()[1])
+                    #     lastocc = float(outcarlines[i_line+self.nbands].split()[2])
+                    #     lastbandno = outcarlines[i_line+self.nbands].split()[0]
+                    #     if lastocc > 0:
+                    #         print "Warning!!! at kpoint ", kpoint, " last band No. ",lastbandno, " is not empty ", lastocc
+
+                    if 'TITEL' in line:
+                        self.potcar_lines.append( line.split()[2:] )
+
+                    if 'LEXCH  =' in line:
+                        # print(line)
+                        self.xc_pot = line.split()[2].strip() #xc from potential 
+
+                    if 'GGA     =' in line:
+                        # print(line)
+                        self.xc_inc = line.split()[2].strip() #xc from incar
+
+                    if 'ions per type =' in line:
+                        self.end.nznucl = [int(n) for n in line.split()[4:]]
+                        self.end.ntypat = len(self.end.nznucl)
+
+                        self.end.natom  = sum(self.end.nznucl)
+
+                        #correction of bug; Take into account that VASP changes typat by sorting impurities of the same type.
+                        self.end.typat = []
+                        for i, nz in enumerate(self.end.nznucl):
+                            for j in range(nz):
+                                self.end.typat.append(i+1)
+                        #correction of bug
 
 
 
+                        # print(self.potcar_lines)
+                        elements = [t[1].split('_')[0] for t in self.potcar_lines]
+                        # printlog('I read ',elements, 'from outcar')
+                        self.end.znucl = [element_name_inv(el) for el in elements]
+                        # print (self.end.znucl)
 
-                if "free  energy   TOTEN  =" in line:
-                    #self.energy = float(line.split()[4])
-                    self.energy_free = float(line.split()[4]) #F free energy
-                if re_lengths.search(line):
-                    self.vlength = [red_prec( float(l),1000 ) for l in outcarlines[i_line + 1].split()[0:3]]
-                    #print self.vlength
-                if "in kB" in line:
-                    self.stress = [float(i)*100 for i in line.split()[2:]]  # in MPa 
-                if "Total  " in line:
-                    self.intstress = [int(float(i)*1000) for i in line.split()[1:]] #stress in internal units; can be regarded as forces
-                
-                if "external pressure =" in line: 
-                    #print iterat
-                    self.extpress = float(line.split()[3]) * 100 # in MPa 
-                    if self.mdstep == 1 : self.extpress_init = self.extpress
+                        ifmaglist, _ = self.end.get_maglist()
 
-                if "E-fermi :" in line: 
+
+                    if 'ISPIN' in line:
+                        if line.split()[2] == '2':
+                            spin_polarized = True
+                            self.spin_polarized = spin_polarized
+                        else:
+                            spin_polarized = False
+                            self.spin_polarized = False
+
+
+                    if "TOO FEW BANDS" in line:
+                        print_and_log("Warning! TOO FEW BANDS!!!\n\n\nWarning! TOO FEW BANDS!!!\n")
+
+
+
+                    #Check W(q)
+                    if 'operators is LMAX' in line:
+                        lmax = int(line.split()[7])
+                        # print 'lmax', lmax
+                    if "W(low)/X(q)" in line:
+                        kk = 1; 
+                        low = []; 
+                        high = [];
+                        
+                        while kk < 100:
+                            if 'Optimization' in outcarlines[i_line + kk] or len(outcarlines[i_line + kk].split() ) != 7: 
+                                break
+                            if 'PSMAXN' in outcarlines[i_line + kk]:
+                                # print(line)
+                                printlog('Warning! PSMAXN for non-local potential too small')
+                                break
+                            # print( 'line', outcarlines[i_line + kk])
+
+                            low.append(  float(outcarlines[i_line + kk].split()[4]) )
+                            high.append( float(outcarlines[i_line + kk].split()[5]) )
+                            kk+=1
+
+
+                        if any(v > 1e-3 for v in low+high):
+                            print_and_log("W(q)/X(q) are too high, check output!\n")
+                            print_and_log('Low + high = ', low+high, imp = 'Y' )
+                            print_and_log([v > 1e-3 for v in low+high], imp = 'Y' )
+                    if "direct lattice vectors" in line:
+                        for v in 0,1,2:
+                            line = outcarlines[i_line+1+v]
+                            line = line.replace('-', ' -')
+                            # print(line)
+                            self.end.rprimd[v] = np.asarray( [float(ri) for ri in line.split()[0:3]   ] )
+
+
+                        #print self.end.rprimd
+                        #print self.rprimd
+                    if "POSITION" in line:
+                        if not contcar_exist or out_type == 'xcarts':
+                            self.end.xcart = [] #clean xcart before filling
+                            for i in range(self.end.natom):
+                                #print outcarlines[i_line+1+i].split()[0:3] 
+                                xcart = np.asarray ( 
+                                            [   float(x) for x in outcarlines[i_line+2+i].split()[0:3]   ] 
+                                        )
+                                
+                                self.end.xcart.append( xcart )
+                                #self.end.xred.append ( xcart2xred( xcart, self.end.rprimd) )
+                    
+                            if out_type == 'xcarts':
+                                self.end.list_xcart.append(self.end.xcart) #xcart at each step only for dimer
+
+                            #the change of typat is accounted below
+
+                    if "number of electron " in line:
+                        # print line
+                        # print line.split()[-1]
+                        try:
+                            self.magn1 = float(line.split()[-1])
+                        except:
+                            self.magn1 = 0
+
+                    if "augmentation part " in line:
+                        try:
+                            self.magn2 = float(line.split()[-1])
+                        except:
+                            self.magn2 = 0
+
+
+                    if force_keyword in line:
+                        # Calculate forces here...
+                        forces = []
+                        magnitudes = []
+
+                        for j in range(self.end.natom):
+                            parts = outcarlines[i_line+j+2].split()
+                            # print "parts", parts
+                            # print(self.end.select)
+                            # sys.exit()
+                            if hasattr(self.end, 'select') and self.end.select:
+                                x = float(parts[ff[0]])*self.end.select[j][0]
+                                y = float(parts[ff[1]])*self.end.select[j][1]
+                                z = float(parts[ff[2]])*self.end.select[j][2]
+                            else:
+                                x = float(parts[ff[0]])
+                                y = float(parts[ff[1]])
+                                z = float(parts[ff[2]])
+                            forces.append([x,y,z])
+                            magnitudes.append(math.sqrt(x*x + y*y + z*z))
+                        average.append( red_prec( sum(magnitudes)/self.end.natom * 1000 ) )
+                        imax = np.asarray(magnitudes).argmax()
+                        maxforce.append( [imax, round(magnitudes[imax] * 1000)]  )
+                        # mforce.append( round(magnitudes[imax] * 1000))
+                        
+                   
+
+                    #Check total drift
+                    if "total drift:" in line:
+                        #print line
+                        tdrift = [float(d) for d in line.split()[2:5]]
+                        #if any(d > 0.001 and d > max(magnitudes) for d in tdrift):
+                            #print_and_log("Total drift is too high = "+str(tdrift)+", check output!\n")
+                            #pass
+
+
+                    if "g(Stress)" in line:
+                        #print line
+                        gstress.append( round( float(line.split()[4])*1000 *100, 3 )  )
+                    #if "Total" in line:
+                        #gstress.append( red_prec(float(line.split()[4])*1000 *100, 1000 )  )
+                    if "volume of cell" in line:
+                        try:                     
+                            self.end.vol = float(line.split()[4])
+                        except ValueError: 
+                            print_and_log("Warning! Cant read volume in calc "+self.name+"\n")
+                        #print self.vol      
+
+                    if "generate k-points for:" in line: 
+                        self.ngkpt = tuple(  [int(n) for n in line.split()[3:]]  )
+                        #print self.set.ngkpt
+
+                      # Kohn-Sham hamiltonian: http://en.wikipedia.org/wiki/Kohn%E2%80%93Sham_equations
+                      #kinetic energy
+                      #+ the external potential + the exchange-correlation energy +
+                      #+ Hartree (or Coulomb) energy
                     # print line
-                    self.efermi = float(line.split()[2]) # in eV
+                    
+                    if  "alpha Z        PSCENC" in line:
+                        # print line
+                        self.energy.alpha = float(line.split()[-1]) # the electrostatic interaction of the ions in a compensating electron gas.
 
-
-                if "Elapsed time" in line:
-                    self.time = float(line.split()[3])
-                if re_nkpts.search(line):
-                    self.NKPTS = float(line.split()[3])
-                if "WARNING" in line:
-                    warnings += 1#line
-
-
-                if "Subroutine DYNSYM returns" in line:
-                    nsgroup = line.split()[4]#number of space group operations
-
-
-
-                if "Iteration" in line:
-                    self.mdstep = int(line.split('(')[0].split()[2].strip())
-                    iterat +=1
-                    if mdstep_old != self.mdstep:
-                        #print "Stress:", self.stress 
-                        nscflist.append( niter ) # add to list number of scf iterations during mdstep_old
-                    niter = int(line.split(')')[0].split('(')[-1].strip()) #number of scf iteration
-                    mdstep_old = self.mdstep
+                    if  "Ewald energy   TEWEN" in line:
+                        self.energy.ewald = float(line.split()[-1]) # the electrostatic interaction of the ions in a compensating electron gas.
+                        # print self.energy.ewald
+                    if  "-1/2 Hartree   DENC" in line or "-Hartree energ DENC" in line:
+                        self.energy.hartree = float(line.split()[-1]) #Coulomb electron-electron energy
+                        # print self.energy.hartree
+                    if  "-V(xc)+E(xc)   XCENC" in line:
+                        self.energy.xc = float(line.split()[-1]) # Kohn-Sham exchange-correlation energy
+                    if  "PAW double counting" in line:
+                        self.energy.pawdc1 = float(line.split()[-2]) #
+                        self.energy.pawdc2 = float(line.split()[-1]) #
+                    if  "eigenvalues    EBANDS" in line:
+                        self.energy.bands = float(line.split()[-1]) # - Kohn Sham eigenvalues - include kinetic energy , but not exactly
+                    if  "atomic energy  EATOM" in line:
+                        self.energy.atomic = float(line.split()[-1]) #energy of atoms in the box
 
 
 
+                    if "energy  without entropy=" in line:
+                        #self.energy = float(line.split()[4])
+                        self.e_without_entr = float(line.split()[3]) #
+                        self.energy_sigma0 = float(line.split()[6]) #energy(sigma->0)
+                        self.e0 = self.energy_sigma0
+                        self.list_e_sigma0.append(  self.energy_sigma0  )
+                        self.list_e_without_entr.append(  self.e_without_entr  )
+
+                        de_each_md_list.append(de_each_md)
 
 
-                i_line += 1
-            #Check total drift
+                    if "energy without entropy =" in line:
+                        e_sig0_prev = e_sig0
+                        try:
+                            e_sig0 = float(line.split()[7])
+                        except:
+                            e_sig0 = 0
+                        de_each_md = e_sig0_prev - e_sig0
+
+                    if "free  energy   TOTEN  =" in line:
+                        #self.energy = float(line.split()[4])
+                        self.energy_free = float(line.split()[4]) #F free energy
+                    
+
+
+
+
+                    if re_lengths.search(line):
+                        self.vlength = [red_prec( float(l),1000 ) for l in outcarlines[i_line + 1].split()[0:3]]
+                        #print self.vlength
+                    if "in kB" in line:
+                        self.stress = [float(i)*100 for i in line.split()[2:]]  # in MPa 
+                    if "Total  " in line:
+                        self.intstress = [int(float(i)*1000) for i in line.split()[1:]] #stress in internal units; can be regarded as forces
+                    
+                    if "external pressure =" in line: 
+                        #print iterat
+                        self.extpress = float(line.split()[3]) * 100 # in MPa 
+                        if self.mdstep == 1 : self.extpress_init = self.extpress
+
+                    if "E-fermi :" in line: 
+                        # print line
+                        self.efermi = float(line.split()[2]) # in eV
+
+
+                    if "Elapsed time" in line:
+                        self.time = float(line.split()[3])
+                    if re_nkpts.search(line):
+                        self.NKPTS = int(line.split()[3])
+                    if "WARNING" in line:
+                        warnings += 1#line
+
+
+                    if "Subroutine DYNSYM returns" in line and not nsgroup:
+                        nsgroup = line.split()[4]#number of space group operations
+                    # if nsgroup == None:
+                    if "Subroutine GETGRP returns:" in line and not nsgroup:
+                        nsgroup = line.split()[4]    
+
+
+                    if "Iteration" in line:
+                        self.mdstep = int(line.split('(')[0].split()[2].strip())
+                        iterat +=1
+                        # print self.mdstep
+                        # print line
+                        if mdstep_old != self.mdstep:
+                            nscflist.append( niter ) # add to list number of scf iterations during mdstep_old
+                        niter = int(line.split(')')[0].split('(')[-1].strip()) #number of scf iterations
+                        mdstep_old = self.mdstep
+
+
+                    if 'number of electron ' in line:
+                        # print (line)
+                        try:
+                            self.mag_sum.append( [float(line.split()[5]), 0])
+                        except:
+                            pass
+
+                    if 'augmentation part' in line:
+                        # print (line)
+                        try:
+                            self.mag_sum[-1][1]= float(line.split()[4])
+                        except:
+                            pass
+
+                    if 'total charge ' in line:
+                        chg = []
+                        for j in range(self.end.natom):
+                            chg.append( float(outcarlines[i_line+j+4].split()[4]) )
+                        
+                        tot_chg_by_atoms.append(np.array(chg))#[ifmaglist])                    
+
+
+                    if 'magnetization (x)' in line:
+                        # print(line)
+                        mags = []
+                        for j in range(self.end.natom):
+                            mags.append( float(outcarlines[i_line+j+4].split()[4]) )
+                        
+                        tot_mag_by_atoms.append(np.array(mags))#[ifmaglist])
+                        # print(ifmaglist)
+                        tot_mag_by_mag_atoms.append(np.array(mags)[ifmaglist])
+                        # print tot_mag_by_atoms
+                        # magnetic_elements
+                        # ifmaglist
+                        # self.tot_mag_by_atoms = tot_mag_by_atoms
+
+
+
+                    if 'LDAUU' in line:
+                        ldauu = line
+
+
+                    if 'onsite density matrix' in line:
+                        i_at = int( outcarlines[i_line-2].split()[2]  ) #starting from one
+                        l_at = int( outcarlines[i_line-2].split()[8]  )
+                        # print (spin_polarized)
+                        spin1 = []
+                        spin2 = []
+                        nm = 2*l_at+1
+                        for i in range(nm):
+                            line = outcarlines[i_line+4+i]
+                            try:
+                                spin1.append( np.array(line.split()).astype(float) )
+                            except:
+                                print_and_log('Warning! Somthing wrong with occ matrix:', line)
+                        if spin_polarized:
+                            for i in range(nm):
+                                # try:
+                                line = outcarlines[i_line+7+nm+i]
+                                # print(line)
+                                line = line.replace('-', ' -')
+                                spin2.append( np.array(line.split()).astype(float) )
+                                # except:
+                                #     printlog('Attention! Could not read spin2, probably no spaces')
+                                #     spin2.append(0)        
+
+                        occ_matrices[i_at-1] = spin1+spin2
+                        # print (np.array(spin1) )
+
+
+                    if 'freq' in show:
+
+                        if 'Eigenvectors and eigenvalues of the dynamical matrix' in line:
+                            freq = []
+
+                            i = 0
+                            while 'ELASTIC MODULI CONTR FROM IONIC RELAXATION' not in line:
+                                i+=1
+                                line = outcarlines[i_line+i]
+                                if 'f  =' in line:
+                                    freq.append(float(line.split()[3]) ) #THz
+                                    # print(line)
+
+
+                    if 'TOTAL ELASTIC MODULI' in line:
+                        eltensor = []
+                        for i in range(9):
+                            line = outcarlines[i_line+i]
+                            print(line.strip())
+                            if i > 2:
+                                eltensor.append([float(c)/10 for c in line.split()[1:]])
+
+                        eltensor = np.asarray(eltensor)
+                        # print(eltensor)
+                        w, v = np.linalg.eig(eltensor)
+                        printlog('Eigenvalues are:', w, imp = 'y')
+                                # eltensor
+
+                    if 'average eigenvalue GAMMA=' in line:
+                        # print(line)
+                        gamma = float(line.split()[-1])
+                        if gamma > 1 and 'conv' in show:
+                            printlog('average eigenvalue GAMMA >1', gamma, imp = 'y')
+                        # sys.exit()
+
+
+
+                    # if 'DIPCOR: dipole corrections for dipol' in line:
+                    if self.mdstep > mdstep_prev:
+                        # print(self.mdstep, dipol)
+                        mdstep_prev = self.mdstep
+
+                    if 'dipolmoment' in line:
+                        self.dipol = line
+                        # print(line)
+
+                        # for i in range(1,4):
+                        #     line = outcarlines[i_line+i]
+                        #     print(line)
+
+
+
+                    # if 'irreducible k-points:': in line:
+                    #     self.nkpt = int(line.split()[1])
+
+
+
+
+                    i_line += 1
+                # sys.exit()
+                #Check total drift
+                
+
+
+
+
+
+
+            try:
+                toldfe = self.set.toldfe  # eV
+            except:
+                toldfe = 0
+
+
+
+
             max_magnitude = max(magnitudes)
             max_tdrift    = max(tdrift)
-            if max_magnitude < self.set.toldff/10: max_magnitude = self.set.toldff
+            self.maxforce = maxforce[-1][1]
+            # if max_magnitude < self.set.toldff/10: max_magnitude = self.set.toldff
+            # print 'magn', magnitudes
+            # print 'totdr', tdrift
+            # print 'max_magnitude', max_magnitude
+            try: 
+                
+                if max_magnitude < self.set.tolmxf: 
+                    max_magnitude = self.set.tolmxf
+            except:
+                ''
+
             #if any(d > 0.001 and d > max_magnitude for d in tdrift):
             if max_tdrift > 0.001 and max_tdrift > max_magnitude:
                 
-                #print_and_log( ("Total drift is too high! At the end one component is %0.f %% of the maximum force, check output!\n") %(maxdrift)  )
+                printlog( "Total drift is too high! At the end one component is {:2.1f} of the maximum force, check output!\n".format(max_tdrift)  )
                 pass
             #else: maxdrift = 
+            # print magn
+            if tot_mag_by_atoms:
+                self.end.magmom = tot_mag_by_atoms[-1].tolist()
 
             """Try to read xred from CONCAR and calculate xcart"""
+
+
+
+
+
+
             #print contcar_exist
+            # print(contcar_exist)
             if contcar_exist:
                 with open(path_to_contcar, 'r') as contcar:
                     
@@ -1358,11 +4622,20 @@ class CalculationVasp(Calculation):
                         
                         if "Direct" in line:
                             self.end.xred = []
-                            for i in range(self.natom):
-                                xr = np.asarray ( [float(x) for x in contcar.next().split()] )
-                                self.end.xred.append( xr )
+                            for i in range(self.end.natom):
+                                try:
+                                    xr = np.asarray ( [float(x) for x in contcar.readline().split()[0:3]] )
+                                    self.end.xred.append( xr )
+                                except:
+                                    self.end.xred.append( [0,0,0] )
 
-                #print self.end.xred
+                                    printlog('Attention!, I could not parse CONTCAR:', path_to_contcar)
+                # print(self.end.xred)
+
+
+
+
+
                 self.end.xcart = xred2xcart( self.end.xred, self.end.rprimd)
             else: 
                 self.end.xred = xcart2xred( self.end.xcart, self.end.rprimd)
@@ -1373,10 +4646,16 @@ class CalculationVasp(Calculation):
             nscflist.append( niter ) # add to list number of scf iterations during mdstep_old
             #print "Stress:", self.stress
             v = self.vlength
+            self.end.vlength = self.vlength
+
             s = self.stress
             yznormal = np.cross(self.init.rprimd[1], self.init.rprimd[2])
             #print yznormal
             #print np.cross( yznormal, np.array([1,0,0]) )
+            if not hasattr(self.init, 'gbpos'):
+                self.init.gbpos = None#for compatability
+
+            self.gbpos = self.init.gbpos #for compatability
             if self.gbpos:
                 if any( np.cross( yznormal, np.array([1,0,0]) ) ) != 0: 
                     print_and_log("Warning! The normal to yz is not parallel to x. Take care of gb area\n")
@@ -1391,6 +4670,38 @@ class CalculationVasp(Calculation):
                 calculate_voronoi(self, state = 'init')
 
 
+            #deal with ldauu
+            u_hubbard = 0
+            if ldauu: 
+                ldauu = np.array(ldauu.split()[7:]).astype(float)
+                # print (ldauu)
+                #find first non-zero
+                self.ldauu = ldauu
+                u_hubbard = ( next((u for u in ldauu if u), 0) )
+                # print ( np.unique(ldauu)  )
+            else:
+                self.ldauu = [0]
+
+            #Check if energy is converged relative to relaxation
+            e_diff_md = self.energy_sigma0
+            if len(self.list_e_sigma0) > 2:
+                e_diff_md = (self.list_e_sigma0[-1] - self.list_e_sigma0[-2])*1000 #meV
+
+            e_diff = (e_sig0_prev - e_sig0)*1000 #meV
+
+            if abs(e_diff) > toldfe*1000:
+                toldfe_warning = '!'
+                print_and_log("Attention!, SCF was not converged to desirable prec", 
+                    round(e_diff,3), '>', toldfe*1000, 'meV', imp = 'y')
+            else:
+                toldfe_warning = ''
+
+            if 'conv' in show:
+                for i, de in enumerate(de_each_md_list ):
+                    if de/toldfe > 1.01:
+                        printlog('Attention! bad SCF convergence {:6.1g} eV for MD step {:}; toldfe = {:6.0g} eV'.format(de, i+1, toldfe))
+
+
             #  Construct beatifull table
             #self.a1 = float(v[0])/2 ; self.a2 = float(v[1])/2/math.sqrt(0.75); self.c = float(v[2])  # o1b
             
@@ -1401,41 +4712,74 @@ class CalculationVasp(Calculation):
             if self.a == None or self.a == [None]:
                 self.a  = 0; self.c = 0
 
-            j = (15,12,7,7,8,9,9,5,5,20,5,20,8,12,20,8,5,8,8,25,8,4,3)
+            j = (35,12,7,7,8,9,14,5,5,20,5,20,8,12,20,8,5,8,8,25,8,4,3)
 
-            d = "&"
+            d = "|"
             name = ("%s.%s.%s" % (self.id[0],self.id[1], str(self.id[2]) )).ljust(j[0])
             etot = ("%.4f" % ( self.energy_sigma0 )).center(j[1])
+            etot1 = ("%.4f" % ( self.energy_sigma0/self.end.natom )).center(j[1])
             # print self.a
             a = ("%.4f" %      ( self.a )      ).center(j[2])
             c = ("%.4f" %      ( self.c )      ).center(j[3])
-            time = ("%.2f" % (self.time/3600.)    ).center(j[4])
+            time = ("%.3f" % (self.time/3600.)    ).center(j[4])
             itertm = ("%.1f" % (self.time/1./iterat)    ).center(j[5])
             Nmd = ("%1i,%2i,%3i" % (self.mdstep, iterat/self.mdstep, iterat)    ).center(j[6])
+            self.iterat = iterat
             War = ("%i" % (warnings)    ).center(j[7])
             #nbands = ("%i" % (self.set.vasp_params["NBANDS"])    ).center(j[8])
             #added = ("%.0f" % ( (self.set.add_nbands - 1) * 100 )    ).center(j[15])
-            kmesh = ("%s" % (str(self.set.ngkpt) )    ).center(j[8])
-            ks = self.calc_kspacings()
-            kspacing = ("[%.2f,%.2f,%.2f]" % ( ks[0], ks[1], ks[2] )    ).center(j[9])
-            ks1 = ("[%.2f]" % ( ks[0] )    ).center(j[9])
-            nkpt = ("%i" % ( self.NKPTS)     ).center(j[10])
-            istrs = ("[%5i,%5i,%5i] " % ( self.intstress[0],self.intstress[1],self.intstress[2]  )    ).center(j[11])
-            strs = ("%.0f,%.0f,%.0f " % ( self.stress[0],self.stress[1],self.stress[2]  )    ).center(j[11])   
-            eprs = ("%.0f" % (self.extpress)).center(j[12])
-            tsm = ("%.0f" % (self.set.tsmear*1000)).center(j[13])
-            entrr = ("%.3f" % (   (self.energy_free - self.energy_sigma0)/self.init.natom * 1000    )   ).center(j[14]) #entropy due to the use of smearing
-            npar = ("%i" % (self.set.vasp_params["NPAR"])).center(j[16])
-            lpl = ("%s" % (self.set.vasp_params["LPLANE"])).center(j[17])
-            ecut = ("%s" % (self.set.vasp_params["ENCUT"]) ).center(j[18]) 
+            try:
+                kmesh = ("%s" % (str(self.ngkpt) )    ).center(j[8])
+                ks = self.calc_kspacings()
+                kspacing = ("[%.2f,%.2f,%.2f]" % ( ks[0], ks[1], ks[2] )    ).center(j[9])
+                ks1 = ("[%.2f]" % ( ks[0] )    ).center(j[9])
+            except:
+                kmesh = ''
+                ks    = ''
+                kspacing = ''
+                ks1     = ''
 
-            lens = ("%.2f;%.2f;%.2f" % (v[0],v[1],v[2] ) ).center(j[19])
+            nkpt = ("%i" % ( self.NKPTS)     ).center(j[10])
+            if self.stress:
+                istrs = ("[%5i,%5i,%5i] " % ( self.intstress[0],self.intstress[1],self.intstress[2]  )    ).center(j[11])
+                strs = ("%.0f,%.0f,%.0f " % ( self.stress[0],self.stress[1],self.stress[2]  )    ).center(j[11])   
+                eprs = ("%.0f" % (self.extpress)).center(j[12])
+            
+            else:
+                istrs = ''
+                strs  = ''
+                eprs =  ''
+            try:
+                tsm = ("%.0f" % (self.set.tsmear*1000)).center(j[13])
+            except:
+                tsm = ''
+
+            entrr = ("%.3f" % (   (self.energy_free - self.energy_sigma0)/self.end.natom * 1000    )   ).center(j[14]) #entropy due to the use of smearing
+
+            try:
+                npar = ("%i" % (self.set.vasp_params["NPAR"])).center(j[16])
+                lpl = ("%s" % (self.set.vasp_params["LPLANE"])).center(j[17])
+                ecut = ("%s" % (self.set.vasp_params["ENCUT"]) ).center(j[18]) 
+            except:
+                npar = ''
+                lpl  = ''
+                ecut = ''
+
+            # lens = ("%.2f;%.2f;%.2f" % (v[0],v[1],v[2] ) ).center(j[19])
+            lens = "{:4.2f};{:4.2f};{:4.2f}".format(v[0],v[1],v[2] ) 
             r1 = ("%.2f" % ( v[0] ) ).center(j[19])            
             vol = ("%.1f" % ( self.end.vol ) ).center(j[20])
-            nat = ("%i" % ( self.natom ) ).center(j[21])
-            totd = ("%.0f" % (   max_tdrift/max_magnitude * 100      ) ).center(j[22])
-            nsg = ("%s" % (     nsgroup     ) ).center(j[22])
+            nat = ("%i" % ( self.end.natom ) ).center(j[21])
+            try:
+                totd = ("%.0f" % (   max_tdrift/max_magnitude * 100      ) ).center(j[22])
+            except:
+                totd = ''
 
+            nsg = ("%s" % (     nsgroup     ) ).center(j[22])
+            Uhu   = " {:3.1f} ".format(u_hubbard)
+            ed    = ' {:3.0f}'.format( e_diff)
+            edg   = ' {:3.1f} '.format( e_diff_md)
+            spg   = ' {:4s} '.format( self.end.sg(silent = 1)[0])
             """Warning! concentrations are calculated correctly only for cells with one impurity atom"""
             #gbcon = ("%.3f" % (     1./self.end.yzarea      ) ).center(j[23]) # surface concentation at GB A-2
             #bcon = ("%.1f" % (     1./self.natom * 100      ) ).center(j[24]) # volume atomic concentration, %
@@ -1454,15 +4798,247 @@ class CalculationVasp(Calculation):
             outst_coseg=voro+etot+d+                                strs+d+eprs+d+nat+d+time+d+Nmd+d+War+d+totd+d+nsg+"\\\\" #for co-segregation; 
             outst_gbe = voro+etot+               d+vol+d+kspacing+d+strs+d+eprs+d+nat+d+time+d+Nmd+d+War+d+nsg+"\\\\" # For comparing gb energies and volume
             outst_imp = voro+etot+d+a+d+c+d+lens+d+vol+d+kspacing+d+       eprs+d+nat+d+time+d+Nmd+d+War+d+totd+d+nsg+"\\\\" # For comparing impurity energies
-                        
+            
+            outst_cathode = d.join([spg,etot, etot1, lens, vol,nkpt, strs, nat, time, Nmd, War, nsg, Uhu, ed, edg ])
             # print self.end.xred[-1]
             #print outstring_kp_ec
-            if 'force' in show:
-                print "Maxforce by md steps (meV/A) = %s;"%(str(maxforce)  )
-                print "Avforce by md steps = %s;"%(str(average)  )
+            # print show
+            # print 'force' in show
 
-            log.write("Reading of results completed\n\n")
+
+            if 'conv' in show:
+                # print('asdf', de_each_md_list)
+                # show achived convergence every step with respect to toldfe, should be less than 1
+                # np.set_printoptions(linewidth=150, formatter={'float':lambda x: "%3.0f->" % x}) #precision=1,
+                np.set_printoptions(precision=0, linewidth=150, )
+                printlog('Conv each step, de/toldfe (toldfe = {:.0g} eV) =  \n{:};'.format(toldfe, np.array([de/toldfe for de in de_each_md_list ])), imp = 'Y')
             
+
+
+
+            if 'fo' in show:
+                # print "Maxforce by md steps (meV/A) = %s;"%(str(maxforce)  )
+                print_and_log("\n\nMax. F."+force_prefix+" (meV/A) = \n{:};".format(np.array([m[1] for m in maxforce ])[:]  ), imp = 'Y'  )
+                # print "\nAve. F. (meV/A) = \n%s;"%(  np.array(average)  )
+                # import inspect
+                # print inspect.getargspec(plt.plot).args
+                # print plt.plot.__doc__
+                if 'p' in show[0]:
+                    plt.plot(maxforce, )
+                    plt.xlabel('MD step')
+                    plt.ylabel('Max. force on atom (meV/$\AA$)')
+                    plt.show()
+            
+            if 'sur' in show:
+                self.sumAO = {}
+                self.devAO = {}
+                for el in 'Li', 'Na', 'Fe', 'O':
+                    if el in self.end.get_elements():
+                        pos  = determine_symmetry_positions(self.end, el)
+                        # print(pos)
+                        # sys.exit()
+                        # xc = self.end.xcart[pos[0][0]]
+                        for ps in pos:
+                            print('position', ps[0])
+                            xc = self.end.xcart[ps[0]]
+
+                            if el == 'O':
+                                neib = 6
+                            else:
+                                neib = 6
+                            sumAO = local_surrounding(xc, self.end, neib, periodic = True, only_elements = [8, 9], control = 'av')#[0]
+                            self.devAO[el+'-O'] = local_surrounding(xc, self.end, neib, periodic = True, only_elements = [8, 9], control = 'av_dev')[0]
+                            print('d_av '+el+'-O:',sumAO )
+                            print('dev_av '+el+'-O:',self.devAO[el+'-O'] )
+                            AO = local_surrounding(xc, self.end, neib, periodic = True, only_elements = [8, 9], control = 'mavm')
+                            print('d_min, d_avex, d_max: {:4.2f}, {:4.2f}, {:4.2f}'.format(*AO))
+
+
+
+
+                            self.sumAO[el+'-O'] = sumAO
+                            if self.id[2] in [1,12]:
+                                self.end.write_xyz(show_around_x = xc, nnumber = neib, filename = self.end.name+'_'+el+'-OF'+str(neib), analysis = 'imp_surrounding', only_elements = [8, 9])
+
+                            if el in ['Li', 'Na']:
+                                neib = 2
+                                sumAO = local_surrounding(xc, self.end, neib, periodic = True, only_elements = [26,], control = 'av')#[0]
+                                if self.id[2] in [1,12]:
+                                    self.end.write_xyz(show_around_x = xc, nnumber = neib, filename = self.end.name+'_'+el+'-Fe'+str(neib), analysis = 'imp_surrounding', only_elements = [26])
+                                
+                                print(el+'-Fe',sumAO )
+                                self.sumAO[el+'-Fe'] = sumAO
+
+
+            if 'en' in show:
+                    maxf = [m[1] for m in maxforce ]
+                    # print(maxf)
+                    plt.plot(maxf, 1000*(np.array(self.list_e_sigma0)-self.energy_sigma0) , '-o')
+                    # plt.xlabel('MD step')
+                    # plt.ylabel('Energy per cell (eV')
+                    plt.xlabel('Max. force on atom (meV/$\AA$)')
+                    plt.ylabel('Energy per cell relative to min (meV)')
+
+                    plt.show()
+
+            if 'smag' in show:
+                # printlog('{:s}'.format([round(m) for m in self.mag_sum]), imp = 'Y' )
+                printlog(np.array(self.mag_sum).round(2), imp = 'Y' )
+
+            if 'mag' in show or 'occ' in show:
+                from analysis import around_alkali
+                numb, dist, chosen_ion = around_alkali(self.end, 4, alkali_ion_number)
+                
+                #probably not used anymore
+                # dist_dic = {}
+                # self.dist_numb = zip(dist, numb)
+                # for d, n in self.dist_numb:
+                #     dist_dic[n] = d 
+                #probably not used anymore
+
+
+            if 'mag' in show and tot_mag_by_atoms:
+                print ('\n\n\n')
+                # print_and_log
+                # print 'Final mag moments for atoms:'
+                # print np.arange(self.end.natom)[ifmaglist]+1
+                # print np.array(tot_mag_by_atoms)
+
+                # print (tot_mag_by_atoms)
+                # if tot_mag_by_atoms:
+                # print ('first step ', tot_mag_by_atoms[0][numb].round(3) )
+                # print ('first step all ', tot_mag_by_atoms[0][ifmaglist].round(3) )
+                # for mag in tot_mag_by_atoms:
+                #     print ('  -', mag[numb].round(3) )
+
+                # print ('last  step ', tot_mag_by_atoms[-1][numb].round(3), tot_chg_by_atoms[-1][numb].round(3) )
+                mmm = tot_mag_by_atoms[-1][numb].round(3)
+
+                print ('atom:mag  = ', ', '.join('{}:{:4.2f}'.format(iat, m) for iat, m  in zip(  numb+1, mmm   )) )
+                if 'a' in show:
+                    ''
+                    # print ('last  step all', tot_mag_by_atoms[-1][ifmaglist].round(3) )
+
+                    # sys.exit()
+                if chosen_ion:
+                    printlog ('Dist from 1st found alkali ion ',element_name_inv( chosen_ion[1]),
+                        ' to sur. transition met atoms: (Use *alkali_ion_number* to choose ion manually)')
+                    print ('atom:dist = ', 
+                    ', '.join('{}:{:.2f}'.format(iat, d) for iat, d  in zip(  numb+1, dist   )  ) )
+
+                # plt.plot(np.array(sur[3]).round(2), tot_mag_by_atoms[-1][numb]) mag vs dist for last step
+                
+                # print ('Moments on all mag atoms:\n', tot_mag_by_atoms[-1][ifmaglist].round(3))
+                if 'p' in show:
+                    plt.plot(np.array(tot_mag_by_mag_atoms)) # magnetization vs md step
+                    plt.show()
+                    plt.clf()
+
+            if 'chg' in show:
+                self.tot_chg_by_atoms = tot_chg_by_atoms[-1] #save for last step only
+                # print(list(zip(self.end.get_elements(), self.tot_chg_by_atoms)))
+                els  = self.end.get_elements()
+                try:
+                    only_el = show.split('.')[1:]
+                except:
+                    only_el = None
+                print('\nMulliken charges are:')
+                for el, ch in zip(els, self.tot_chg_by_atoms):
+                    if only_el == None or (only_el and el in only_el):
+                        print('{:s} {:4.2f};'.format(el, ch), end = ' ')
+                print()
+            if 'occ' in show:
+                ''
+                # print (matrices)
+                # print (df)
+                if chosen_ion:
+                    print_and_log('Distances (A) from alkali ion #',chosen_ion[0]+1,' to transition atoms:', 
+                        ',  '.join([ '({:}<->{:}): {:.2f}'.format(chosen_ion[0]+1, iat, d) for d, iat in zip(  dist, numb+1  )  ]), imp = 'Y'  )
+                
+                show_occ_for_atoms = [int(n) for n in re.findall(r'\d+', show)]
+                # print (show_occ_for_atom)
+                # sys.exit()
+                if show_occ_for_atoms:
+                    iat = show_occ_for_atoms[0]-1
+                    # dist_toi = dist_dic[iat]
+                    i_mag_at = iat
+                else:
+                    i = 0
+                    # dist_toi = dist[i]
+                    i_mag_at = numb[i]
+                # print (st.znucl[st.typat[i_mag_at]-1] )
+                l05 = len(occ_matrices[i_mag_at])//2
+
+                df = pd.DataFrame(occ_matrices[i_mag_at]).round(5)
+
+                print_and_log( 'Occ. matrix for atom ', i_mag_at+1, end = '\n', imp = 'Y'  )
+                    # ':  ; dist to alk ion is ',  dist_toi, 'A', end = '\n' )
+                print_and_log('Spin 1:',end = '\n', imp = 'Y'  )
+                print_and_log(tabulate(df[0:l05], headers = ['dxy', 'dyz', 'dz2', 'dxz', 'dx2-y2'], floatfmt=".1f", tablefmt='psql'),end = '\n', imp = 'Y'  )
+                # print(' & '.join(['d_{xy}', 'd_{yz}', 'd_{z^2}', 'd_{xz}', 'd_{x^2-y^2}']))
+                # print_and_log(tabulate(occ_matrices[i_mag_at][l05:], headers = ['d_{xy}', 'd_{yz}', 'd_{z^2}', 'd_{xz}', 'd_{x^2-y^2}'], floatfmt=".1f", tablefmt='latex'),end = '\n' )
+                # print(tabulate(a, tablefmt="latex", floatfmt=".2f"))
+                print_and_log('Spin 2:',end = '\n', imp = 'Y'  )
+                print_and_log(tabulate(df[l05:], floatfmt=".1f", tablefmt='psql'), imp = 'Y'  )
+            self.occ_matrices = occ_matrices
+            
+
+
+            if 'freq' in show:
+                dos = [1]*len(freq)
+                # from scipy.ndimage.filters import gaussian_filter
+                from scipy.signal import butter, lfilter, freqz
+                # blurred = gaussian_filter(freq, sigma=7)
+                fmin = min(freq)
+                fmax = max(freq)
+                fw   = fmax-fmin
+
+                finefreq = np.linspace(fmin, fmax, 1000)
+                dos = [0]*1000
+
+                # for i in range(1000):
+                # print(fw)
+                for f in freq:
+                    # print(f)
+                    i = int( np.round( (f-fmin)/ fw * 999 ,0) )
+                    dos[i] = 1
+                    # print(i, finefreq[i], f)
+                
+
+                def butter_lowpass(cutoff, fs, order=5):
+                    nyq = 0.5 * fs
+                    normal_cutoff = cutoff / nyq
+                    b, a = butter(order, normal_cutoff, btype='low', analog=False)
+                    return b, a
+
+                def butter_lowpass_filter(data, cutoff, fs, order=5):
+                    b, a = butter_lowpass(cutoff, fs, order=order)
+                    y = lfilter(b, a, data)
+                    return y
+
+                order = 6
+                fs = 30.0       # sample rate, Hz
+                cutoff = 3.667  # desired cutoff frequency of the filter, Hz
+
+                y = butter_lowpass_filter(finefreq, cutoff, fs, order)
+
+                plt.plot(finefreq, smoother(smoother(dos,50), 50), '-') 
+                plt.savefig('figs/'+str(self.id)+'.eps')
+                # plt.show()
+                plt.clf()
+
+            # sys.exit()
+
+
+            printlog("Reading of results completed\n\n", imp = 'n')
+            
+            if pymatgen_flag:
+                ''
+                # self.end.write_cif(os.path.join(self.dir,self.name))
+            
+
+            # print(out_type)
+            # sys.exit()
             if   out_type == 'gbe'  : outst = outst_gbe
             elif out_type == 'e_imp': outst = outst_imp
             elif out_type == 'e_seg': outst = outst_seg            
@@ -1470,65 +5046,245 @@ class CalculationVasp(Calculation):
             elif 'ecut' in out_type : outst = outst_ecut
             elif 'kp' in out_type   : outst = outst_kp
             elif 'ts' in out_type   : outst = outst_ts
-            else: outst = outst_all
+            
+            elif not header.siman_run:
+                outst_simple = '|'.join([etot, lens, strs, Nmd])
+                # print("Bi2Se3.static.1               |  -20.1543  |    10.27;10.27;10.27    | -680,-680,-657 |   1,13, 13   |    ")
+                if header.show_head:
+                    printlog("name                          |  energy(eV)|    Vector lenghts (A)   | Stresses (MPa)     | N MD, N SCF   ", end = '\n', imp = 'Y')
+                    header.show_head = False
+                
+                outst = outst_simple
+            else: 
+                printlog('Output type: outst_cathode')
+                outst = outst_cathode
             #else: print_and_log("Uknown type of outstring\n")
 
 
+            #save cif file
 
-
-            return outst
 
         else:
-            print_and_log("Still no OUTCAR for mystery reason\n\n")
-            # raise RuntimeError
+            # if not hasattr(cl,'energy_sigma0'):
+            cl = self
+            try:
+                os.rename(cl.path['output'], cl.path['output']+"_unfinished") 
+                printlog('read_results():',cl.id, 'is unfinished, continue:', cl.dir, cl.cluster_address, imp = 'y')
+                cl.state = '5. Unfinished'
+            except FileNotFoundError:
+                printlog('read_results():',cl.id, 'probably was not submitted:', cl.dir, imp = 'y')
 
-    def get_chg_file(self, filetype = 'CHGCAR'):
+
+        return outst
+
+
+
+
+    def determine_filenames(self, nametype = 'asoutcar'):
+        """
+        try to determine correct filenames
+        """
+        if nametype == 'asoutcar':
+            for filetype in 'CHGCAR', 'AECCAR0', 'AECCAR2':
+                self.path[filetype.lower()] = self.path['output'].replace('OUTCAR',filetype)
+                printlog('determine_filenames()',self.path[filetype.lower()])
+
+
+
+    def get_chg_file(self, filetype = 'CHGCAR', nametype = '', up = 'up1'):
+        #allow to get any file of type filetype 
         #cl - object of CalculationVasp class
-        path_to_chg = self.dir+str(self.version)+"."+filetype
-        if not os.path.exists(path_to_chg): 
-            print 'Charge file is downloading'
-            log.write( runBash("rsync -zave ssh "+cluster_address+":"+project_path_cluster+path_to_chg+" "+self.dir)+'\n' ) #CHG
-            print path_to_chg, 'was downloaded'
+        #filetype (str) - 'CHG', 'CHGCAR', etc
+        #nametype (str) - 'asoutcar' - update filetype to OUTCAR format
+        #up = up1 - donot update
+              #up2 - update
+
+        #Comment
+            #initially used for chg files - rename!
+        if nametype == 'asoutcar':
+            path_to_chg = self.path['output'].replace('OUTCAR',filetype)
+        else:
+            path_to_chg = os.path.join( os.path.dirname(self.path['output']), filetype)
+
+        if 'CHGCAR' in filetype:
+            self.path['chgcar'] = path_to_chg
+        elif 'xml' in filetype:
+            self.path['xml'] = path_to_chg
+
+
+        # print(path_to_chg)
+        # print(self.cluster_address)
+        # print(self.project_path_cluster+'/')
+        # sys.exit()
+        path2file_cluster = self.project_path_cluster+'/'+path_to_chg
+        if os.path.exists(path_to_chg) and 'up2' not in up: 
+            out = None
+        else:
+            out = get_from_server(path2file_cluster, os.path.dirname(path_to_chg), addr = self.cluster_address)
+
+
+        if out:
+            printlog('File', path2file_cluster, 'was not found, trying archive:',header.PATH2ARCHIVE, imp = 'Y')
+            # printlog('Charge file', path_to_chg, 'was not found')
+            try:
+                pp = self.project_path_cluster.replace(self.cluster_home, '') #project path without home
+            except:
+                pp = ''
+            # print(pp)
+            path_to_chg_scratch = header.PATH2ARCHIVE+'/'+pp+'/'+path_to_chg
+
+            out = get_from_server(path_to_chg_scratch, os.path.dirname(path_to_chg), addr = self.cluster_address)
             
+            if out:
+                printlog('File', path_to_chg_scratch, 'was not found', imp = 'Y')
+                path_to_chg = None
+           
+        printlog('File', path_to_chg, ' was download', imp = 'e')
+        
         return path_to_chg
 
-    def get_file(self, filename):
-        #cl - object of CalculationVasp class
-        # filename - standart Vasp file name
-        path_to_file = self.dir+str(self.version)+"."+filename
-        if not os.path.exists(path_to_file): 
-            log.write( runBash("rsync -zave ssh "+cluster_address+":"+project_path_cluster+path_to_file+" "+self.dir)+'\n' ) #CHG
-            print path_to_file, 'was downloaded'
-            
-        return path_to_file
+    def get_file(self, *args, **kwargs):
+
+        return self.get_chg_file(*args, **kwargs)
 
 
-    def bader_analysis(self):
+
+
+    def bader(self):
+        chgcar = self.path['chgcar']
+        acf = self.dir+'/ACF.dat'
+        printlog('Bader should be installed', imp = 'Y')
+        if not os.path.isfile(acf):
+            cwd = os.getcwd()
+            os.chdir(self.dir)
+            print(runBash('bader ' + os.path.basename(chgcar) ) )
+            os.chdir(cwd)
+
+        else:
+            charges = []
+            with open(acf, 'r') as f:
+                for line in f:
+                    try:
+                        charges.append(round(float(line.split()[4]), 3))
+                    except:
+                        pass
+            print(dict(zip(charges, self.end.get_elements())))
+
+
+
+    def get_bader_ACF(self, p = 0):
         #Make bader on server
-        #assumes that bader is intalled
+        #assumes that bader is installed
+        self.res()
         v = str(self.version)
-        path = project_path_cluster+self.dir
-        CHG     = path+v+".CHG"
-        AECCAR0 = path+v+".AECCAR0"
-        AECCAR2 = path+v+".AECCAR2"
+        path = self.project_path_cluster+'/'+self.dir
+        ppc = self.project_path_cluster+'/'
+        self.determine_filenames()
+
+        # print()
+        CHG_scratch_gz  = header.PATH2ARCHIVE+'/'+self.dir+'/'+v+".CHGCAR.gz"
+
+        CHG     = ppc + self.path['chgcar']
+        AECCAR0 = ppc + self.path['aeccar0']
+        AECCAR2 = ppc + self.path['aeccar2']
         CHGCAR_sum = path+v+".CHGCAR_sum"
         baderlog =  path+v+".bader.log"
-        command1 = "cd "+path+"; ~/utils/chgsum.pl "+AECCAR0+" "+AECCAR2+"; "+\
-        "mv CHGCAR_sum "+CHGCAR_sum+";"
-        command2 = \
-        "cd "+path+"; ~/utils/bader "+CHG+" -ref "+CHGCAR_sum+" > "+\
-        v+".bader.log; mv ACF.dat "+v+".ACF.dat; mv AVF.dat "+v+".AVF.dat; mv BCF.dat "+v+".BCF.dat;"
-        # print "ssh "+cluster_address+" '"+command1+"'"
+        ACF      = path+v+'.ACF.dat'
+        self.path['acf'] = ACF
+
+
+
+        command1 = "cd "+path+"; ~/tools/vts/chgsum.pl "+AECCAR0+" "+AECCAR2+"; "+\
+        "mv CHGCAR_sum "+CHGCAR_sum+";" # on cluster
+
+        command_chg_gunzip = 'gunzip '+CHG+'.gz ' # on cluster
         
-        if runBash("ssh "+cluster_address+" '[ -e "+   CHGCAR_sum       +""" ] || echo "NO"     ;' """): #true if file not exists
-            print  CHGCAR_sum, "not exist. try to calculate it "
-            log.write( runBash("ssh "+cluster_address+" '"+command1+"'")+'\n' ) 
+        command2 = "rsync "+CHG_scratch_gz+' '+path+' ; gunzip '+CHG+'.gz ' # on cluster
+
+        mv = v+".bader.log; mv ACF.dat "+v+".ACF.dat; mv AVF.dat "+v+".AVF.dat; mv BCF.dat "+v+".BCF.dat; cat "+v+".bader.log"
         
-        if runBash("ssh "+cluster_address+" '[ -e "+   baderlog       +""" ] || echo "NO"     ;' """): #true if file not exists
-            print  baderlog, "not exist. try to calculate Bader "
-            log.write( runBash("ssh "+cluster_address+" '"+command2+"'")+'\n' ) 
-        ACF = runBash("ssh "+cluster_address+" 'cat "+path+v+".ACF.dat"  +"'" )
-        # print ACF
+        command3 = "cd "+path+"; ~/tools/bader "+CHG+" -ref "+CHGCAR_sum+" > "+mv
+        command3s = "cd "+path+"; ~/tools/bader "+CHG+" > "+mv #simple
+        
+        command_check_CHG_sum = " [ -e "+   CHGCAR_sum       +""" ] || echo "NO"     ; """ #true if file not exists
+        command_check_CHG  = " [ -e "+   CHG       +""" ] || echo "NO"     ; """
+        command_check_ACF  = " [ -e "+   ACF     +""" ] || echo "NO"     ; """
+        command_cat_ACF    = " cat "+path+v+".ACF.dat"
+        # run_on_server()
+        
+
+        #Calculate CHGCAR_sum
+        if run_on_server(command_check_CHG_sum, self.cluster_address): 
+            print_and_log(  CHGCAR_sum, "does not exist. trying to calculate it ", imp = 'Y')
+            printlog( run_on_server(command1, self.cluster_address)+'\n', imp = 'Y' ) 
+        # sys.exit()
+
+        #Check chgcar
+        if run_on_server(command_check_CHG, self.cluster_address): #true if file not exists
+            printlog( 'Warning! File ', CHG, "does not exist. Checking .gz .. ", imp = 'Y')
+
+            printlog( run_on_server(command_chg_gunzip, self.cluster_address)+'\n', imp = 'y' ) 
+
+        if run_on_server(command_check_CHG, self.cluster_address): #true if file not exists
+            printlog( 'Warning! File ', CHG, "does not exist. Trying to restore it from archive .. ", imp = 'Y')
+
+            printlog( run_on_server(command2, self.cluster_address)+'\n', imp = 'y' ) 
+
+
+
+        def run_bader(command, ):        
+            if run_on_server(command_check_ACF, self.cluster_address): #true if file not exists
+                print_and_log(  ACF, " does not exist. trying to calculate Bader ... ", imp = 'Y')
+                printlog( run_on_server(command, self.cluster_address)+'\n', imp = 'y' ) 
+                
+
+
+
+            ACF_text = run_on_server(command_cat_ACF, self.cluster_address)
+            return ACF_text
+
+        ACF_text = run_bader(command3)
+
+        if 'No such file or directory' in ACF_text:
+            printlog('Warning! Probably you have problems with',CHGCAR_sum)
+            printlog('Trying to calculate charges from CHGCAR ...', imp = 'Y')
+            ACF_text = run_bader(command3s)
+
+        print('ACF_text = ', ACF_text)
+
+
+        if ACF_text:
+            ACF_l = ACF_text.splitlines()
+        charges = []
+        
+
+        for line in ACF_l:
+            try:
+                charges.append(round(float(line.split()[4]), 3))
+            except:
+                pass
+        
+        self.charges = charges
+
+        # print(charges[[1,2]])
+        if p:
+            print(list(zip(charges, self.end.get_elements())))
+
+
+        return charges
+        
+
+
+
+
+
+
+
+    def bader_coseg():
+
+        "used in coseg project Ti- C,O" 
+        ACF = self.get_bader_ACF()
+
         ACF = ACF.splitlines()[2:] #list of lines with charges for each atom
 
         # print ACF[0]
@@ -1543,1961 +5299,210 @@ class CalculationVasp(Calculation):
 
         local_atoms = local_surrounding(self.xcart[-1], self.end, 6, control = 'atoms')
         numbers = local_atoms[2] # first atom is impurity
-        print numbers
+        # print numbers
         imp_partial_chg = imp_valence_chg - float(ACF[numbers[0]].split()[4])
 
         mat_partial_chg = [mat_valence_chg - float(ACF[i].split()[4]) for i in numbers[1:] ]
-        print "Partial charge of impurity ", imp_partial_chg
-        print "Partial charges of neibouring Ti atoms", " ".join("{:.2f}".format(m) for m in mat_partial_chg)
-        print "Partial charge of matrix", sum(mat_partial_chg)
+        print_and_log( "Partial charge of impurity ", imp_partial_chg, imp = 'Y' )
+        print_and_log( "Partial charges of neibouring Ti atoms", " ".join("{:.2f}".format(m) for m in mat_partial_chg), imp = 'Y' )
+        print_and_log( "Partial charge of matrix", sum(mat_partial_chg), imp = 'Y' )
         
-        print "Sum of mat and imp charges:", sum(mat_partial_chg)+imp_partial_chg
+        print_and_log( "Sum of mat and imp charges:", sum(mat_partial_chg)+imp_partial_chg, imp = 'Y' )
 
-        # print command1
-        # print command2
-        return
-
-
-        # if not os.path.exists(path_to_chg): 
-        #     log.write( runBash("rsync -ave ssh "+cluster_address+":"+project_path_cluster+path_to_chg+" "+self.dir)+'\n' ) #CHG
-        #     print path_to_chg, 'was downloaded'
-            
         return path_to_chg
-"""Functions related to CalculationVasp class"""
-def get_chg_file(cl):
-    #cl - object of CalculationVasp class
-    pass
 
 
+    def check_job_state(self):
+        #check if job in queue or Running
 
+        cl = self
+        if header.check_job == 1:
+            job_in_queue = ''
+            if hasattr(cl,'schedule_system'):
 
-class InputSet():
-    """docstring for InputSet"""
-    def __init__(self,ise):
-        #super(InputSet, self).__init__()
-        self.ise = ise
-        self.potdir = {}
-        self.units = "abinit"
-        self.vasp_params = {}
-        self.mul_enaug = 1
-        self.history = "Here is my uneasy history( :\n"     
-        # self.kpoints_file = False
-        # self.use_ngkpt = False
+                check_string =  cl.id[0]+'.'+cl.id[1]
+                if 'SLURM' in cl.schedule_system:
 
+                    job_in_queue = check_string in run_on_server("squeue -o '%o' ", cl.cluster_address)
+                    printlog(cl.id[0]+'.'+cl.id[1], 'is in queue or running?', job_in_queue)
 
-    def update(self):
-        c1 = 1; c2 = 1
-        if self.units == "abinit":
-            c1 = to_eV
-            c2 = Ha_Bohr_to_eV_A
-        #Update Vasp parameters
-        if self.units == "vasp":
-            c1 = 1
-            c2 = 1
-        if self.ecut == None:
-            self.vasp_params['ENCUT'] = None
-            self.vasp_params['ENAUG'] = None
-        else:           
-            self.vasp_params['ENCUT'] = self.ecut * c1* self.dilatmx * self.dilatmx
-            self.vasp_params['ENAUG'] = self.mul_enaug * self.vasp_params['ENCUT']
-        self.vasp_params['SIGMA'] = self.tsmear * c1
-        self.vasp_params['EDIFF'] = self.toldfe * c1
-        self.vasp_params['NELM'] = self.nstep
-        self.vasp_params['NSW'] = self.ntime
-        self.vasp_params['EDIFFG'] = -self.tolmxf * c2
+                elif 'PBS' in cl.schedule_system:
+                    job_in_queue = check_string in run_on_server("qstat -x ", cl.cluster_address)
 
-
-
-    def set_LREAL(self,arg):
-        if type(arg) is not str:
-            sys.exit("\nset_LREAL error\n")
-        old = self.vasp_params['LREAL']    
-        self.vasp_params['LREAL'] = arg
-        if old == arg:
-            print "Warning! You did not change one of your parameters in new set"
-            return
-        self.history += "LREAL was changed from "+str(old)+" to "+str(arg) + "\n"
-        self.update()
-
-    def set_ngkpt(self,arg):
-        if type(arg) is not tuple:
-            sys.exit("\nset_ngkpt type error\n")
-        old = copy.copy(self.ngkpt)     
-        self.ngkpt = copy.copy(arg)
-        self.kpoints_file = True
-        self.vasp_params['KSPACING'] = None
-        if old == arg:
-            print "Warning! You did not change one of your parameters in new set"
-            return
-        self.history += "ngkpt was changed from "+str(old)+" to "+str(arg) + " and KPOINTS file was swithed on\n"
-        self.update()
-
-    def set_tsmear(self,arg):
-        if type(arg) is not float:
-            sys.exit("\nset_tsmear error\n")
-        old = self.tsmear   
-        self.tsmear = arg
-        if old == arg:
-            print "Warning! You did not change one of your parameters in new set"
-            return
-        self.history += "tsmear was changed from "+str(old)+" to "+str(arg) + "\n"
-        self.update()
-
-    def set_KGAMMA(self,arg):
-        if type(arg) is not str:
-            sys.exit("\nset_KGAMMA error\n")
-        old = self.vasp_params['KGAMMA']    
-        self.vasp_params['KGAMMA'] = arg
-        if old == arg:
-            print "Warning! You did not change one of your parameters in new set"
-            return
-        self.history += "KGAMMA was changed from "+str(old)+" to "+str(arg) + "\n"
-        self.update()
-
-    def add_conv_kpoint(self,arg):
-        if type(arg) is not str:
-            sys.exit("\nadd_conv_kpoint error\n")
-        if arg in self.conv_kpoint:
-            print "Warning! You already have this name in list"
-            return    
-        self.conv_kpoint.append(arg)
-        self.history += "Name "+arg+" was added to self.conv_kpoint\n"
-        self.update()
-
-    def add_conv_tsmear(self,arg):
-        if type(arg) is not str:
-            sys.exit("\nadd_conv_tsmear type error\n")
-        try:
-            self.conv_tsmear[0]
-        except AttributeError:
-            log.write( "Error! Set "+self.ise+" does not have conv_tsmear, I create new\n")
-            self.conv_tsmear = []
-        if arg in self.conv_tsmear:
-            print "Warning! You already have this name in list"
-            return    
-        self.conv_tsmear.append(arg)
-        self.history += "Name "+arg+" was added to self.conv_tsmear\n"
-        self.update()
-
-    def add_conv(self,arg,type_of_conv):
-        if type(arg) is not str:
-            raise TypeError
-        if type_of_conv not in ["kpoint_conv","tsmear_conv","ecut_conv","nband_conv","npar_conv"]:
-            raise TypeError
-        try:
-            self.conv[type_of_conv][0]
-        except AttributeError:
-            log.write( "Warning! Set "+self.ise+" does not have conv, I create new\n")
-            self.conv = {}
-        except KeyError:
-            log.write( "Warning! Set "+self.ise+" does not have list for this key in conv, I add new\n")
-            self.conv[type_of_conv] = []
-        except IndexError:
-            pass
-        if arg in self.conv[type_of_conv]:
-            print_and_log( "Warning! You already have name %s in list of conv %s. Nothing done.\n" % \
-            (str(arg), str(self.conv[type_of_conv])    ) )
-            return    
-        self.conv[type_of_conv].append(arg)
-        self.history += "Name "+arg+" was added to self.conv["+type_of_conv+"]\n"
-        log.write( "Name "+arg+" was added to self.conv["+type_of_conv+"] of set "+self.ise+" \n")
-        self.update()
-
-
-    def set_potential(self,znucl, arg):
-        
-        if type(arg) is not str:
-            sys.exit("\nset_potential error\n")
-        
-        if znucl in self.potdir:
-            if arg == self.potdir[znucl]:
-                print_and_log( "Warning! You already have the same potential for "+str(znucl)+" element\n" )
-                return    
-        # print type(self.potdir)
-        self.potdir[znucl] = arg
-        self.history += "Potential for "+str(znucl)+" was changed to "+arg+"\n"
-        self.update()
-        return
-
-    def set_compare_with(self,arg):
-        if type(arg) is not str:
-            raise TypeError ("\nset_compare_with error\n")
-        self.compare_with += arg+" "
-
-    def set_PREC(self,arg):
-        if arg not in ["Normal", "Accurate"]:
-            raise TypeError
-        old = self.vasp_params['PREC']    
-        self.vasp_params['PREC'] = arg
-        if old == arg:
-            print_and_log("Warning! You did not change one of your parameters in "+self.ise+" set\n")
-            return
-        self.history += "PREC was changed from "+str(old)+" to "+str(arg) + "\n"
-
-    def set_ecut(self,arg):
-        old = self.ecut    
-        if arg == 'default':
-            self.ecut = None
-        elif type(arg) not in [float, int]:
-            raise TypeError
-        else:
-            self.ecut = arg
-        if old == arg:
-            print_and_log("Warning! You did not change one of your parameters in "+self.ise+" set\n")
-            return
-        self.history += "ecut was changed from "+str(old)+" to "+str(arg) + "\n"
-        log.write("ecut was changed from "+str(old)+" to "+str(arg) + " in set "+self.ise+" \n")
-        self.update()
-
-    def set_dilatmx(self,arg):
-        if type(arg) not in [float, int]:
-            raise TypeError
-        old = self.dilatmx    
-        self.dilatmx = arg
-        if old == arg:
-            print_and_log("Warning! You did not change one of your parameters in "+self.ise+" set\n")
-            return
-        self.history += "dilatmx was changed from "+str(old)+" to "+str(arg) + "\n"
-        log.write("dilatmx was changed from "+str(old)+" to "+str(arg) + " in set "+self.ise+" \n")
-
-    def set_add_nbands(self,arg):
-        name = "add_nbands"  
-        if type(arg) not in [float, ]:
-            raise TypeError
-        try: self.add_nbands
-        except AttributeError: self.add_nbands = 1.
-        old = self.add_nbands    
-        self.add_nbands = arg
-        if old == arg:
-            print_and_log("Warning! You did not change  "+name+"  in "+self.ise+" set\n")
-            return
-        self.history += " "+name+"  was changed from "+str(old)+" to "+str(arg) + "\n"
-        log.write(" "+name+"  was changed from "+str(old)+" to "+str(arg) + " in set "+self.ise+" \n")
-        
-
-    def set_nmdsteps(self,arg):
-        name = "number of MD steps"
-        if type(arg) not in [int, ]:
-            raise TypeError
-        try: self.ntime
-        except AttributeError: self.ntime = 1.
-        old = self.ntime    
-        self.ntime = arg
-        if old == arg:
-            print_and_log("Warning! You did not change  "+name+"  in "+self.ise+" set\n")
-            return
-        self.history += " "+name+"  was changed from "+str(old)+" to "+str(arg) + "\n"
-        log.write(" "+name+"  was changed from "+str(old)+" to "+str(arg) + " in set "+self.ise+" \n")
-        self.update()
-
-
-    def set_relaxation_type(self,type_of_relaxation):
-        name = "Type of relaxation ISIF"
-        if type(type_of_relaxation) not in [str, ]:
-            raise TypeError
-        old = self.vasp_params["ISIF"]
-        if "ions" == type_of_relaxation:
-            if int(self.ise[0]) != 9:
-                print_and_log("Warning! The name of set is uncostintent with relaxation type\n")
-                raise TypeError     
-            self.vasp_params["ISIF"] = 2
-            # self.set_nmdsteps(200)
-        elif type_of_relaxation == "full":
-            if int(self.ise[0]) != 2:
-                print_and_log("Warning! The name of set is uncostintent with relaxation type\n")
-                raise TypeError              
-            self.vasp_params["ISIF"] = 3
-        else:
-            print_and_log("Error! Uncorrect type of relaxation\n")
-            raise TypeError
-        arg = self.vasp_params["ISIF"]
-        if old == arg:
-            print_and_log("Warning! You did not change  "+name+"  in "+self.ise+" set\n")
-            return
-        self.history += " "+name+"  was changed from "+str(old)+" to "+str(arg) + "\n"
-        log.write(name+"  was changed from "+str(old)+" to "+str(arg) + " in set "+self.ise+" \n")
-        self.update()                
-        #print self.history
-
-    def set_ALGO(self,arg):
-        name = "speed of calculation ALGO"
-        if arg not in ["Normal","Fast" ]:
-            raise TypeError
-        old = self.vasp_params["ALGO"]
-        self.vasp_params["ALGO"] = arg
-        if old == arg:
-            print_and_log("Warning! You did not change  "+name+"  in "+self.ise+" set\n")
-            return
-        self.history += " "+name+"  was changed from "+str(old)+" to "+str(arg) + "\n"
-        log.write(name+"  was changed from "+str(old)+" to "+str(arg) + " in set "+self.ise+" \n")
-        self.update() 
-
-
-    def set_IBRION(self,arg):
-        name = "algorithm of relaxation  IBRION"
-        if arg not in ["CG","damped","RMM", "MD" ]:
-            raise TypeError
-        old = self.vasp_params["IBRION"]
-        if "CG" == arg:
-            self.vasp_params["IBRION"] = 2
-        elif "damped" == arg:
-            self.vasp_params["IBRION"] = 3
-        elif "RMM" == arg:
-            self.vasp_params["IBRION"] = 1
-        elif "MD" == arg:
-            self.vasp_params["IBRION"] = 0
-        else:
-            print_and_log("Error! Uncorrect algorithm of relaxation\n")
-            raise TypeError
-        arg = self.vasp_params["IBRION"]
-        if old == arg:
-            print_and_log("Warning! You did not change  "+name+"  in "+self.ise+" set\n")
-            return
-        self.history += " "+name+"  was changed from "+str(old)+" to "+str(arg) + "\n"
-        log.write(name+"  was changed from "+str(old)+" to "+str(arg) + " in set "+self.ise+" \n")
-        self.update()
-
-
-    def set_LPLANE(self,arg):
-        name = "control of parallezation LPLANE"
-        if arg not in [".TRUE.",".FALSE." ]:
-            raise TypeError
-        old = self.vasp_params["LPLANE"]
-        self.vasp_params["LPLANE"] = arg
-        if old == arg:
-            print_and_log("Warning! You did not change  "+name+"  in "+self.ise+" set\n")
-            return
-        self.history += " "+name+"  was changed from "+str(old)+" to "+str(arg) + "\n"
-        log.write(name+"  was changed from "+str(old)+" to "+str(arg) + " in set "+self.ise+" \n")
-        self.update() 
-
-    def set_NPAR(self,arg):
-        name = "control of parallezation NPAR"
-        if type(arg) not in [int, ]:
-            raise TypeError
-        old = self.vasp_params["NPAR"]
-        self.vasp_params["NPAR"] = arg
-        if old == arg:
-            print_and_log("Warning! You did not change  "+name+"  in "+self.ise+" set\n")
-            return
-        self.history += " "+name+"  was changed from "+str(old)+" to "+str(arg) + "\n"
-        log.write(name+"  was changed from "+str(old)+" to "+str(arg) + " in set "+self.ise+" \n")
-        self.update()
-
-
-    def set_NELMIN(self,arg):
-        name = "minimum number of scf steps NELMIN"
-        if type(arg) not in [int, ]:
-            raise TypeError
-        old = self.vasp_params["NELMIN"]
-        self.vasp_params["NELMIN"] = arg
-        if old == arg:
-            print_and_log("Warning! You did not change  "+name+"  in "+self.ise+" set\n")
-            return
-        self.history += " "+name+"  was changed from "+str(old)+" to "+str(arg) + "\n"
-        log.write(name+"  was changed from "+str(old)+" to "+str(arg) + " in set "+self.ise+" \n")
-        self.update()
-
-    def set_tolmxf(self,arg):
-        name = "relaxation until the forces will be less than tolmxf"
-        if type(arg) not in [float, ]:
-            raise TypeError
-        old = self.tolmxf
-        self.tolmxf = arg
-        if old == arg:
-            print_and_log("Warning! You did not change  "+name+"  in "+self.ise+" set\n")
-            return
-        self.history += " "+name+"  was changed from "+str(old)+" to "+str(arg) + "\n"
-        log.write(name+"  was changed from "+str(old)+" to "+str(arg) + " in set "+self.ise+" \n")
-        self.update()
-
-    def set_toldfe(self,arg):
-        name = "energy tolerance toldfe"
-        if type(arg) not in [float, ]:
-            raise TypeError
-        old = self.toldfe
-        self.toldfe = arg
-        if old == arg:
-            print_and_log("Warning! You did not change  "+name+"  in "+self.ise+" set\n")
-            return
-        self.history += " "+name+"  was changed from "+str(old)+" to "+str(arg) + "\n"
-        log.write(name+"  was changed from "+str(old)+" to "+str(arg) + " in set "+self.ise+" \n")
-        self.update()
-
-    def set_vaspp(self,token,arg,des="see manual"):
-
-        if token in ("ISMEAR",):
-            if type(arg) not in [int, None, ]:
-                raise TypeError
-        if token in ("KSPACING",):
-            if type(arg) not in [float, None, ]:
-                raise TypeError
-
-
-        old = self.vasp_params[token]
-        self.vasp_params[token] = arg
-        if old == arg:
-            print_and_log("Warning! You did not change  "+token+"  in "+self.ise+" set\n")
-            return
-        self.history += " "+token+"  was changed from "+str(old)+" to "+str(arg) + "\n"
-        log.write(token+"  was changed from "+str(old)+" to "+str(arg) +" - "+ des+" in set "+self.ise+" \n")
-        self.update()
-
-
-
-def clean_run():
-    type = 'PBS'
-    with open('run','w') as f:
-    
-        if type == 'SGE':
-            f.write("#!/bin/tcsh\n")
-            f.write("module load sge\n")
-            f.write("module load vasp/parallel/5.2.12\n")
-        if type == 'PBS':
-            f.write("#!/bin/bash\n")
-
-    # f.close()
-    return
-
-
-def complete_run(close_run = True):
-    
-    if close_run:
-
-        f = open('run','a')
-        f.write("qstat\n")
-        f.write("sleep 2\n")
-        f.write("mv run last_run\n")
-        f.close()
-        runBash('chmod +x run')
-
-        log.write( runBash("rsync -zave ssh run "+cluster_address+":"+project_path_cluster) +"\n" )
-        print 'run sent'
-        clean_run()
-    
-    return
-
-
-def plot_conv(list_of_calculations, calc, type_of_plot, conv_ext = [], labelnames = None):
-    """
-    Allows to fit and plot different properties;
-    Input:
-    'type_of_plot' - ("fit_gb_volume"-fits gb energies and volume and plot dependencies without relaxation and after it,
-     )
-
-
-    """
-
-            
-    def fit_and_plot(x1, y1, x2, y2, power, name = "", xlabel = "", ylabel = "", image_name = "test", lines = None):
-        """Should be used in two below sections!
-        Creates one plot with two dependecies and fit them;
-        return minimum fitted value of x2 and corresponding valume of y2; 
-        if name == "" image will not be plotted
-        power - the power of polynom
-
-        lines - add lines at x = 0 and y = 0
-
-        """
-        coeffs1 = np.polyfit(x1, y1, power)        
-        coeffs2 = np.polyfit(x2, y2, power)
-        
-        fit_func1 = np.poly1d(coeffs1)
-        fit_func2 = np.poly1d(coeffs2)
-        
-        #x_min  = fit_func2.deriv().r[power-2] #derivative of function and the second cooffecient is minimum value of x.
-        #y_min  = fit_func2(x_min)
-        
-        if name:
-
-            x_range = np.linspace(min(x2), max(x2))
-            fit_y1 = fit_func1(x_range); 
-            fit_y2 = fit_func2(x_range); 
-            
-            plt.figure(figsize=(8,6.1))
-            # plt.title(name)
-            plt.ylabel(ylabel)
-            plt.xlabel(xlabel)
-            plt.xlim(min(x2)-0.1*abs(min(x2) ), max(x2)+0.1*abs(min(x2)))
-
-            plt.plot(x1, y1, 'ro', label = 'initial')
-            plt.plot(x2, y2, 'bo', label = 'relaxed'   )
-            plt.plot(x_range, fit_y1, 'r-',) #label = 'init_fit')
-            plt.plot(x_range, fit_y2, 'b-',) #label = 'r_fit'   )
-            plt.legend(loc =9)
-            
-            if lines == 'xy':
-                plt.axvline(color='k')
-                plt.axhline(color='k')
-
-
-
-            plt.tight_layout()
-            #plt.savefig('images/'+image_name)
-            print 'Saving file ...',path_to_images+str(image_name)+'.png'
-            plt.savefig(path_to_images+str(image_name)+'.png',format='png', dpi = 300)
-        return fit_func2  
-
-
-
-
-    conv = list_of_calculations
-    name = []; n = conv[0]
-    name.append( n[0] )
-    image_name = n[0]+'_'+n[1]+'_'+str(n[2])
-
-    energies = []; init_energies = []
-    volumes = []
-    gb_volumes = []
-    pressures = []
-    pressures_init = []
-    sigma_xx = []
-    sigma_yy = []
-    sigma_zz = []
-    e_gbs = [] 
-    e_gbs_init = []
-
-    if type_of_plot == "e_imp":
-        e_imps = []
-        v_imps = []
-        lengths = []
-        for id in conv:        
-            e_imps.append(calc[id].e_imp*1000)
-            v_imps.append(calc[id].v_imp)
-            l = calc[id].vlength
-            lengths.append( "%s\n%.1f\n%.1f\n%.1f"%(id[0],l[0], l[1], l[2]) )
-        #l = lengths[0]
-        #print str(l[0])+'\n'+str(l[1])+'\n'+str(l[2])
-
-
-        xlabel = "Sizes, $\AA$"
-        ylabel = "Impurity energy, meV"
-        ylabel2 = "Impurity volume, $\AA^3$"
-        plt.figure()
-        plt.title(str(name)+' other cells')
-        plt.ylabel(ylabel)
-        plt.xlabel(xlabel)
-        x = range( len(e_imps) )
-        plt.xticks(x, lengths)
-        plt.plot(x, e_imps, 'ro-', label = 'energy')
-        plt.legend()
-        plt.twinx()
-        plt.ylabel(ylabel2)
-        plt.plot(x, v_imps, 'bo-', label = 'volume')
-
-        plt.subplots_adjust(left=None, bottom=0.2, right=None, top=None,
-                wspace=None, hspace=None)
-        #plt.ticker.formatter.set_scientific(True)
-        plt.legend(loc =9)
-        plt.savefig('images/e_imp_'+str(image_name)+'.png',format='png')#+str(image_name))#+'e_imp')
-
-
-    if type_of_plot == "e_2imp":
-
-        def dist_between_imp(cl):
-            """Only for two impurities"""
-
-            return np.linalg.norm(cl.end.xcart[-1] - cl.end.xcart[-2]) #assuming that impurities are at the end of xcart list.
-
-        e_imps = [] # binding energy
-        dist = [] #dist between impurities
-        
-        e_imps_ex = []
-        dist_ex = []
-        name_ex = []
-
-        for id in conv:        
-            cl = calc[id]
-            e_imps.append(cl.e_imp*1000)
-            #dist.append( "%s\n%.1f"%(id[0],dist_between_imp(cl) ) )
-            dist.append( dist_between_imp(cl)  )
-
-
-
-
-
-
-
-        xlabel = "Distance between atoms, $\AA$"
-        ylabel = "Interaction energy, meV"
-        plt.figure()
-        
-        # plt.title(str(name)+' v1-15')
-
-        plt.ylabel(ylabel)
-        plt.xlabel(xlabel)
-        #x = range( len(e_imps) )
-        #plt.xticks(x, dist)
-        # plt.yscale('log')
-        # plt.yscale('semilog')
-        if labelnames:
-            label = labelnames
-        else:
-            label = []
-            label[0] = str(name)
-            label[1] = name_ex[0]
-            label[2] = name_ex[1]
-
-
-        plt.plot(dist, e_imps, 'ro-', label = label[0], linewidth = 2 )
-        
-
-        if conv_ext: #manually add 
-            for conv in conv_ext:
-                e_imps_ex.append([])
-                dist_ex.append([])
-                for id in conv:        
-                    cl = calc[id]
-                    e_imps_ex[-1].append(cl.e_imp*1000)
-                    #dist.append( "%s\n%.1f"%(id[0],dist_between_imp(cl) ) )
-                    dist_ex[-1].append( dist_between_imp(cl)  )
-                name_ex.append(id[0])
-            plt.plot(dist_ex[0], e_imps_ex[0], 'go-', label = label[1], linewidth = 2)
-            plt.plot(dist_ex[1], e_imps_ex[1], 'bo-', label = label[2], linewidth = 2)
-
-
-
-
-
-
-        plt.axhline(color = 'k') #horizontal line
-
-        plt.tight_layout()
-
-        # plt.subplots_adjust(left=None, bottom=0.2, right=None, top=None,
-        #         wspace=None, hspace=None)
-        # #plt.ticker.formatter.set_scientific(True)
-        plt.legend(loc =9)
-        plt.savefig(path_to_images+'e_2imp_'+str(image_name)+'.png',format='png', dpi = 300)#+str(image_name))#+'e_imp')
-
-
-    if type_of_plot == "fit_gb_volume_pressure":
-
-        for id in conv:
-            #energies.append(calc[id].energy_sigma0)
-            #init_energies.append( calc[id].list_e_sigma0[0] ) 
-            gb_volumes.append(calc[id].v_gb)
-            #volumes.append(calc[id].end.vol)
-            pressures.append(calc[id].extpress/1000. )
-            pressures_init.append(calc[id].extpress_init/1000. )
-            sigma_xx.append( calc[id].stress[0]  )
-            sigma_yy.append( calc[id].stress[1]  )
-            sigma_zz.append( calc[id].stress[2]  )
-            #pressures_init = pressures
-            e_gbs.append(calc[id].e_gb)
-            e_gbs_init.append(calc[id].e_gb_init )           
-            # print calc[id].bulk_extpress
-
-        power = 3
-
-        fit_ve = fit_and_plot(gb_volumes, e_gbs_init,  gb_volumes, e_gbs, power, 
-            name, "Grain boundary expansion (m$\AA$)", "Grain boundary energy (mJ/m$^2$)", 
-            image_name+"_fit_ve")
-
-
-        fit = fit_and_plot(pressures_init, e_gbs_init,  pressures, e_gbs, power, 
-            name, "External pressure (GPa)", "Grain boundary  energy (mJ/m$^2$)", 
-            image_name+"_pe")
-        #print fit
-        ext_p_min  = fit.deriv().r[power-2] #external pressure in the minimum; derivative of function and the value of x in minimum
-
-        fit_sxe = fit_and_plot(sigma_xx, e_gbs_init,  sigma_xx, e_gbs, power, 
-            name, "Sigma xx (MPa)", "Grain boundary energy (mJ/m$^2$)", 
-            image_name+"_sxe")
-        sxe_min = fit_sxe.deriv().r[power-2] #sigma xx at the minimum of energy
-        print "sigma xx at the minimum of energy is", sxe_min," MPa"
-
-
-        fit1 = fit_and_plot(pressures_init, gb_volumes,  pressures, gb_volumes, 1,
-            name, "External pressure (GPa)", "Grain boundary expansion (m$\AA$)", 
-            image_name+"_pv", lines = 'xy')
-        #print fit1
-        pulay = - calc[id].bulk_extpress
-        #print " At external pressure of %.0f MPa; Pulay correction is %.0f MPa." % (ext_p_min+pulay, pulay)       
-        #print " Egb = %.1f mJ m-2; Vgb = %.0f mA;"%(fit(ext_p_min), fit1(ext_p_min)  )
-        print ("%s.fit.pe_pv & %.0f & %.0f & %0.f & %0.f \\\\" %
-            (n[0]+'.'+n[1], fit(ext_p_min), fit1(ext_p_min),ext_p_min, ext_p_min+pulay   ))
-
-
-        #print "\n At zero pressure with Pullay correction:"
-        #print " Egb = %.1f mJ m-2; Vgb = %.0f mA; " % (fit(-pulay), fit1(-pulay))
-        outstring =  ("%s.fit.pe_pv & %.0f & %.0f & %0.f & %0.f\\\\" %(n[0]+'.'+n[1], fit(-pulay), fit1(-pulay),-pulay,0    ))
-        # print outstring
-        calc[conv[0]].egb = fit(-pulay)
-        calc[conv[0]].vgb = fit1(-pulay)
-
-        return outstring #fit(ext_p_min), fit1(ext_p_min) 
-
-
-    if type_of_plot == "fit_gb_volume":
-        """
-        should be rewritten using fit_and_plot() function
-        """
-
-        for id in conv:
-            #energies.append(calc[id].energy_sigma0)
-            #init_energies.append( calc[id].list_e_sigma0[0] ) 
-            gb_volumes.append(calc[id].v_gb)
-            e_gbs.append(calc[id].e_gb)
-            e_gbs_init.append(calc[id].e_gb_init )           
-
-
-        power = 3
-        fit_ve = fit_and_plot(gb_volumes, e_gbs_init,  gb_volumes, e_gbs, power, 
-            name, "Excess volume ($m\AA$)", "Twin energy ($mJ/m^2$)", 
-            image_name+"_fit_ve")
-
-        vgb_min  = fit_ve.deriv().r[power-2]
-
-
-        #print "Fit of excess volume against energy. Pressure is uknown:"
-        #print "Test Egb_min = %.1f mJ m-2; v_min = %.0f mA;"%(fit_ve(vgb_min), vgb_min)
-        print ("%s.fit.ve & %.0f & %.0f & - & - \\\\" %
-            (n[0]+'.'+n[1], fit_ve(vgb_min), vgb_min,   ))
-
-    if type_of_plot == "fit_gb_volume2":
-
-        for id in conv:
-            energies.append(calc[id].energy_sigma0)
-            init_energies.append( calc[id].list_e_sigma0[0] ) 
-            volumes.append(calc[id].end.vol)
-            pressures.append(calc[id].extpress )
-            pressures_init.append(calc[id].extpress_init )
-
-        power = 3
-        pulay = 500
-
-        fit_ve = fit_and_plot(volumes, init_energies,  volumes, energies, power, 
-            name, "Volume ($\AA^3$)", "Energy  sigma->0 ($eV$)", 
-            image_name+"_fit_ve")
-        
-        Vmin  = fit_ve.deriv().r[power-2] # minimum volume at the minimum energy
-        Emin  = fit_ve(Vmin)
-
-        fit_pe = fit_and_plot(pressures_init, init_energies,  pressures, energies, power, 
-            name, "External pressure ($MPa$)", "Energy  sigma->0 ($eV$)", 
-            image_name+"_fit_pe")
-
-        ext_p_min  = fit_pe.deriv().r[power-2] #external pressure in the minimum; derivative of function and the value of x in minimum
-        
-
-        fit_pv = fit_and_plot(pressures_init, volumes,  pressures, volumes, 1,
-            name, "External pressure ($MPa$)", "Volume of cell ($\AA^3$)", 
-            image_name+"_fit_pv")
-
-
-             
-        atP = (" Emin = %.3f meV;  Vmin = %.0f A^3; "%( fit_pe(ext_p_min), fit_pv(ext_p_min)  )  ) + \
-              (" for the minimum of energy relative to external pressure. The value of pressure is %.0f MPa; Pulay correction is %.0f MPa." % (ext_p_min+pulay, pulay) )
-        
-        at_zeroP = (" Emin = %.3f meV;  Vmin = %.0f A^3; " % (fit_pe(-pulay), fit_pv(-pulay) )  ) + \
-                   (" the value of energy and volume at zero pressure with Pullay correction" )
-        
-        #print " Emin = %.3f meV;  Vmin = %.0f A^3;  for the minimum of energy relative to volume at some external pressure"%(fit_ve(Vmin), Vmin )
-        #print atP
-        #print at_zeroP
-
-        print "Compare V at -pulay and V for energy minimum", fit_pv(-pulay), Vmin
-
-        return fit_pe(-pulay), fit_pv(-pulay), Emin, Vmin
-
-
-
-
-
-
-
-
-    if type_of_plot == "kpoint_conv":
-        energies = []
-        kpoints = []
-        times = []
-
-        for id in list_of_calculations:
-            if "4" not in calc[id].state:
-                continue
-            energies.append(calc[id].potenergy)
-            kpoints.append(calc[id].kspacing[2])
-            times.append(calc[id].time)
-
-            name.append( id[1] )
-
-        plt.figure()
-        plt.title(name)
-        plt.plot(kpoints, energies,'bo-')
-        plt.ylabel("Total energy (eV)")
-        plt.xlabel("KSPACING along 3rd recip. vector ($\AA ^{-1}$)")
-        plt.twinx()
-        plt.plot(kpoints,times,'ro-')
-        plt.ylabel("Elapsed time (min)")
-        plt.savefig('images/'+str(conv[0])+'kconv')
-
-
-    if type_of_plot == "contour":
-        alist = [] ;        clist = []
-        nn = str(calc[conv[0]].id[0])+"."+str(calc[conv[0]].id[1])
-        f = open("a_c_convergence/"+nn+"/"+nn+".out","w")
-        f.write("END DATASET(S)\n")
-        k = 1
-        for id in conv: #Find lattice parameters and corresponding energies
-            a = calc[id].a
-            c = calc[id].c
-            if a not in alist: alist.append(a); 
-            if c not in clist: clist.append(c);
-            f.write( "acell%i %f %f %f Bohr\n"%(k, calc[id].a/to_ang, calc[id].a/to_ang, calc[id].c/to_ang )   )
-            #print "etotal%i %f\n"%(k, calc[id].energy_sigma0/to_eV ),
-            k+=1;
-        X,Y = np.meshgrid(alist, clist)
-        Z = np.zeros(X.shape)
-        Zinv = np.zeros(X.shape)
-
-        
-        k=1
-        for i in range(len(alist)):
-            for j in range(len(clist)):
-                for id in conv:
-                    if calc[id].a == alist[i] and calc[id].c == clist[j]:
-                        Z[i][j] = calc[id].energy_sigma0
-                        Zinv[j][i] = calc[id].energy_sigma0
-                        f.write( "etotal%i %f\n"%(k, calc[id].energy_sigma0/to_eV )   )
-                        k+=1
-        f.write("+Overall time at end (sec) : cpu=     976300.2  wall=     976512.8")
-        f.close
-
-        #Make two plots for different a and c
-        plt.figure()
-        plt.title(name)
-        for i in range(len(alist)):
-            plt.plot(clist, Z[i],'o-',label='a='+str(alist[i]))
-        plt.legend()
-        plt.ylabel("Total energy (eV)")
-        plt.xlabel("c parameter ($\AA$)")
-        plt.savefig('images/'+str(conv[0])+'c')
-
-        plt.figure()
-        plt.title(name)
-        for j in range(len(clist)):
-            plt.plot(alist, Zinv[j],'o-',label='c='+str(clist[j]))
-        plt.legend()
-        plt.ylabel("Total energy (eV)")
-        plt.xlabel("a parameter ($\AA$)")
-        plt.savefig('images/'+str(conv[0])+'a')
-
-        #Make contour
-        plt.figure()
-        cf = plt.contourf(X, Y, Z, 20,cmap=plt.cm.jet)
-        cbar = plt.colorbar(cf)
-        cbar.ax.set_ylabel('Energy (eV)')
-
-        plt.xlabel('$a$ ($\AA$)')
-        plt.ylabel('$c/a$')
-
-        plt.legend()
-        plt.savefig('images/ru-contourf.png')
-        #plt.show()
-
-
-        #Make equation of state
-        eos = EquationOfState(clist,Z[2])
-        v0, e0, B = eos.fit()
-        #print "a = ", alist[2]
-        print '''
-v0 = {0} A^3
-E0 = {1} eV
-B  = {2} eV/A^3'''.format(v0, e0, B)
-        eos.plot('images/a[2]-eos.png')
-
-        eos = EquationOfState(alist,Zinv[2])
-        v0, e0, B = eos.fit()
-        #print "c = ", clist[2]
-        print '''
-v0 = {0} A^3
-E0 = {1} eV
-B  = {2} eV/A^3'''.format(v0, e0, B)
-        eos.plot('images/c[2]-eos.png')
-
-
-    if type_of_plot == "dimer":
-
-
-        x1 = [] #list of distances
-
-        cl =  calc[list_of_calculations[0]]
-        if cl.end.natom > 2:
-            raise RuntimeError
-
-
-        for xcart in cl.end.list_xcart:
-            # x = xcart[1]
-            # d = (x[0]**2 + x[1]**2 + x[2]**2)**0.5
-            d = np.linalg.norm(xcart[1]-xcart[0]) #assuming there are only two atoms
-
-
-            x1.append(d)
-
-        y1 = cl.list_e_without_entr
-        power = 4
-        name = 'dimer'
-        xlabel = 'Bond length'
-        ylabel = 'Full energy'
-        coeffs1 = np.polyfit(x1, y1, power)        
-      
-        fit_func1 = np.poly1d(coeffs1)
-
-        x_range = np.linspace(min(x1), max(x1))
-        fit_y1 = fit_func1(x_range); 
-        f = fit_func1.deriv()
-        min_e = fit_func1(f.r[2]).real
-        print "The minimum energy per atom and optimal length of dimer are {:.3f} eV and {:.3f} A".format( min_e/2., f.r[2].real)
-        print "The atomization energy for dimer is {:.3f} eV ; The energy of atom in box is taken from the provided b_id".format(min_e - 2*cl.e_ref)
-
-        plt.figure()
-        plt.title(name)
-        plt.ylabel(ylabel)
-        plt.xlabel(xlabel)
-        plt.plot(x1, y1, 'ro', label = 'init')
-        plt.plot(x_range, fit_y1, 'r-', label = 'init_fit')
-        plt.show()
-    return
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-def add_calculation(structure_name,inputset,version,first_version,last_version,input_folder,blockdir,calc,varset,update = "no"
-    ,inherit_option = None, prevcalcver = None, coord = 'direct', savefile = "all", input_geo_format = 'abinit'):
-    """Adds new or updates 
-    up2 - allows to update only unfinished
-
-    input_geo_format - abinit, vasp
-    """
-    id = (structure_name,inputset,version)
-    try:
-        calc[id]
-        status = "exist"
-        print_and_log(str(calc[id].name)+" has been already created and has state: "+str(calc[id].state)+"\n\n")
-        if "4" in calc[id].state: 
-            complete_state = calc[id].state
-            status = "compl"
-            if update == 'up2': 
-                print 'Calculation', calc[id].name, 'is finished, continue'
-                return
-            pass
-            if update != "up1": return #completed calculations updated only for "up1"
-
-    except KeyError:
-        #update = "up"
-        status = "new"
-        print_and_log( "There is no calculation with id "+ str(id)+". I create new with set "+str(inputset)+"\n" )        
-    if "up" in update:
-        if status in ["exist","compl"]: print_and_log("You asked to update existing calculation with id "+ str(id)+" Warning! I update creating new class \n" )         
-
-        calc[id] = CalculationVasp( varset[id[1]] )
-        calc[id].id = id 
-        calc[id].name = str(id[0])+'.'+str(id[1])+'.'+str(id[2])
-
-        calc[id].dir = blockdir+"/"+ str(id[0]) +'.'+ str(id[1])+'/'
-        
-        if update in ['up1', 'up2']:
-            if not os.path.exists(calc[id].dir):
-                log.write( runBash("mkdir -p "+calc[id].dir) )         #Create directory if does not exist
-                log.write( runBash("ssh "+cluster_address+" ' mkdir -p "+calc[id].dir+" ' ") )
-            if id[2] == first_version:
-                calc[id].write_sge_script() #write header only once
-
-        print_and_log("I am searching for geofiles in folder "+input_folder+"\n" )
-        if input_geo_format == 'abinit': 
-            searchinputtemplate = input_folder+'/*.geo*'
-        elif input_geo_format == 'vasp': 
-            searchinputtemplate = input_folder+'/POSCAR*'
-        # print  input_geo_format
-        geofilelist = glob.glob(searchinputtemplate) #Find input_geofile
-        # print geofilelist
-
-        #additional search in target folder if no files in root
-        if not geofilelist:
-            print_and_log("Attention! trying to find here "+input_folder+"/target\n" )
-            geofilelist = glob.glob(input_folder+'/target/*.geo*') #Find input_geofile            
-
-
-        for input_geofile in geofilelist:
-            #print runBash("grep version "+str(input_geofile) )
-            if input_geo_format == 'abinit':
-                curv = int( runBash("grep version "+str(input_geofile) ).split()[1] )
-            elif input_geo_format == 'vasp': 
-                print input_geofile, 'is input_geofile'
-                print input_geofile.split('-')[-1], ' is ver'
-
-                curv = int(input_geofile.split('-')[-1] ) #!Applied only for phonopy POSCAR-n naming convention
-                print curv, 'is curv'
-
-
-
-            if curv == id[2]:
-                
-                if input_geo_format == 'abinit':
-                    calc[id].read_geometry(input_geofile)
-                
-                elif input_geo_format == 'vasp':
-                    calc[id].read_poscar(input_geofile)
-                
                 else:
-                    raise RuntimeError
+                    print_and_log('Attention! unknown SCHEDULE_SYSTEM='+'; Please teach me here! ', imp = 'y')
+                    job_in_queue = ''
 
+
+            if file_exists_on_server(os.path.join(cl.dir, 'RUNNING'), addr = cl.cluster_address) and job_in_queue: 
                 
+                cl.state = '3. Running'
 
-                break
-        if calc[id].path["input_geo"] == None: 
-            print_and_log("Could not find geofile in this list: "+ str(geofilelist)+  "\n")
-            raise NameError #
-        #print  calc[id].des
-        calc[id].des += ' '+struct_des[id[0]].des + '; ' + varset[id[1]].des
-        #print  calc[id].des
-
-        calc[id].check_kpoints()    
-
-
-
-
-
-        if update in ['up1', 'up2']:
-            calc[id].write_structure(str(id[2])+".POSCAR", coord, inherit_option, prevcalcver)
-            calc[id].write_sge_script(str(version)+".POSCAR", version, inherit_option, prevcalcver, savefile)
-            #if calc[id].path["output"] == None:
-            calc[id].path["output"] = calc[id].dir+str(version)+".OUTCAR" #set path to output
-
-            if id[2] == first_version:
-                calc[id].add_potcar()
-            
-            calc[id].calculate_nbands()
-
-            if id[2] == last_version:        
-                calc[id].make_incar_and_copy_all(update)
-                calc[id].make_run()
-
-
-        if status == "compl": calc[id].state = complete_state #Even if completed state was updated, the state does not change
-
-
-        print_and_log("\nCalculation "+str(id)+" added or updated\n\n")
-
-    return
-
-
-
-
-
-
-
-
-
-
-
-
-
-        
-def headers():
-    j = (7,12,14,7,8,9,9,5,5,20,5,20,8,12,20,8,5,8,8)
-    d="&"
-    header_for_bands= "Set".ljust(j[0])+d+"Etot".center(j[1])+d+"a1,a2".center(j[2])+d+"c".center(j[3])\
-                +d+"time, m".center(j[4])+d+"ittime, s".center(j[5])+d+"Nmd,Avr.".rjust(j[6])+d\
-                +"Warn!"+d+"nband"+d+"Added, \%"+"\\\\"
-
-    header_for_ecut= "Set".ljust(j[0])+d+"Etot".center(j[1])+d+"a1,a2".center(j[2])+d+"c".center(j[3])\
-                +d+"time, m".center(j[4])+d+"ittime, s".center(j[5])+d+"Nmd,Avr.".rjust(j[6])+d\
-                +"Warn!"+d+"Ecut,eV"+"\\\\"
-
-    header_for_npar= "Set".ljust(j[0])+d+"Etot".center(j[1])+d+"a1,a2".center(j[2])+d+"c".center(j[3])\
-                +d+"time, m".center(j[4])+d+"ittime, s".center(j[5])+d+"Nmd,Avr.".rjust(j[6])+d\
-                +"Warn!"+d+"NPAR".center(j[16])+d+"LPLANE".center(j[17])+"\\\\"
-
-    header_for_kpoints= "Set".ljust(j[0])+d+"Etot".center(j[1])+d+"a1,a2".center(j[2])+d+"c".center(j[3])\
-                +d+"time, m".center(j[4])+d+"ittime, s".center(j[5])+d+"Nmd,Avr.".rjust(j[6])+d\
-                +"Warn!"+d+"k-mesh".center(j[8])+d+"k-spacings".center(j[9])+d+"nkpt".center(j[10])+"\\\\"
-    header_for_tsmear= "Set".ljust(j[0])+d+"Etot".center(j[1])+d+"a1,a2".center(j[2])+d+"c".center(j[3])\
-                +d+"time, m".center(j[4])+d+"ittime, s".center(j[5])+d+"Nmd,Avr.".rjust(j[6])+d\
-                +"Warn!"+d+"k-mesh".center(j[8])+d+"tsmear, meV".center(j[13])+d+"Smearing error, meV/atom".center(j[14])+"\\\\"
-
-    header_for_stress= "Set".ljust(j[0])+d+"Etot".center(j[1])+d+"a1,a2".center(j[2])+d+"c".center(j[3])\
-                +d+"time, m".center(j[4])+d+"ittime, s".center(j[5])+d+"Nmd,Avr.".rjust(j[6])+d\
-                +"Warn!"+d+"Stress, intr u.*1000".center(j[11])+d+"Pressure, MPa".center(j[12])
-    #print "\\hline"
-    return header_for_kpoints
-
-def gb_energy_volume(gb,bulk):
-    if (gb.end.rprimd[1] != bulk.end.rprimd[1]).any() or (gb.end.rprimd[2] != bulk.end.rprimd[2]).any():
-        print_and_log("Warning! You are trying to calculate gb_energy from cells with different lateral sizes:"+str(gb.end.rprimd)+" "+str(bulk.end.rprimd)+"\n")
-    #print bulk.vol
-    V_1at = bulk.vol / bulk.natom #* to_ang**3
-
-    E_1at = bulk.energy_sigma0 / bulk.natom 
-    A = np.linalg.norm( np.cross(gb.end.rprimd[1], gb.end.rprimd[2])  ) #surface area of gb
-    #print A
-    gb.v_gb =      ( gb.vol              - V_1at * gb.natom) / A / 2. * 1000
-    gb.e_gb =      ( gb.energy_sigma0    - E_1at * gb.natom) / A / 2. * eV_A_to_J_m * 1000
-    gb.e_gb_init = ( gb.list_e_sigma0[0] - E_1at * gb.natom) / A / 2. * eV_A_to_J_m * 1000
-    gb.bulk_extpress = bulk.extpress     
-    #print "Calc %s; e_gb_init = %.3f J/m^2; e_gb = %.3f J/m; v_gb = %.3f angstrom "%(gb.name, gb.e_gb_init, gb.e_gb, gb.v_gb )
-    outst = "%15s&%7.0f&%7.0f"%(gb.name, gb.e_gb, gb.v_gb)
-    return outst
-
-
-
-
-def add_loop(it,ise,verlist, calc = None, conv = None, varset = None, up = 'test',typconv="",from_geoise = '', inherit_option = None, 
-    coord = 'direct', savefile = "allx", show = [], comment = None, input_geo_format = 'abinit'):
-    """To create folders and add calculations add_flag should have value 'add' 
-
-    'from_geoise' - part of folder name with geometry input files. allows to use geomery files from different sets.
-    please find how it was used
-
-    'up' == "no_base": only relevant for typconv
-     is the same as "up1", but the base set is ommited
-     up2 - update only unfinished calculations
-
-    savefile - controls files to be saved
-
-    """
-    if not calc:
-        calc = header.calc
-        conv = header.conv
-        varset = header.varset
-
-    header.close_run = True
-    if type(verlist) == int: #not in [tuple, list]:
-        #print "verlist"
-        verlist = [verlist]; #transform to list
-    #global history;
-    #hstring = ( "add_loop('%s','%s',%s,calc,conv,varset, '%s', '%s', '%s' ) #at %s" %
-    #    (it,ise,verlist,up, typconv, from_geoise, 
-    # datetime.date.today() ) )
-    
-    #if hstring not in header.history:   header.history.append( hstring  )
-    hstring = ("%s    #on %s"% (traceback.extract_stack(None, 2)[0][3],   datetime.date.today() ) )
-    try:
-        if hstring != header.history[-1]: header.history.append( hstring  )
-    except:
-        header.history.append( hstring  )
-
-    #clean_run()
-
-    #ifolder = "geo/"+it #the default place for input geometries
-
-    #print struct_des['hs221O'] 
-    nc = it+'.'+ise+typconv
-    fv = verlist[0]; lv = verlist[-1];
-    if typconv == "": setlist = (ise,)#
-    elif up == "no_base": setlist = varset[ise].conv[typconv][1:]; up = "up1"
-    else: setlist = varset[ise].conv[typconv] #
-    try: conv[nc]; 
-    except KeyError: 
-        if typconv: conv[nc] = []    
-    for inputset in setlist:
-
-        if from_geoise:
-            from_geoise = from_geoise[0]+inputset[1:] #it is supposed that the difference can be only in first digit
-            ifolder = "geo/"+it+"/" + it+"."+from_geoise #+ "/" + "grainA_s" #geo used for fitted
-        else: ifolder = "geo/"+struct_des[it].sfolder+"/"+it
-
-
-        prevcalcver = None #version of previous calculation in verlist
-
-        for v in verlist:
-            id = (it,inputset,v)
-            if typconv and id not in conv[nc]: conv[nc].append(id)
-            try: blockfolder = varset[inputset].blockfolder
-            except AttributeError: blockfolder = varset[ise].blockfolder
-            cfolder = struct_des[it].sfolder+"/"+blockfolder #calculation folder
-            add_calculation(it,inputset,v, fv, lv, ifolder, cfolder, calc, varset, up, inherit_option, prevcalcver, coord, savefile, input_geo_format)
-            prevcalcver = v
-    #complete_run(close_run)
-    if up not in ('up1','up2'): print_and_log("You are in the test mode, please change up to up1; "); raise RuntimeError
-    return
-
-
-
-def res_loop(it, setlist, verlist,  calc = None, conv = {}, varset = {}, analys_type = 'no', b_id = (), 
-    typconv='', up = 0 , imp1 = None, imp2 = None, matr = None, voronoi = False, r_id = None, readfiles = True, plot = True, show = [], 
-    comment = None, input_geo_format = None, savefile = None, energy_ref = 0 ):
-    """Read results
-    INPUT:
-    'analys_type' - ('gbe' - calculate gb energy and volume and plot it. b_id should be appropriete cell with 
-        bulk material,
-        'e_imp' ('e_imp_kp', 'e_imp_ecut') - calculate impurity energy - just difference between cells with impurity and without.
-        'fit_ac' - fit a and c lattice constants using 2-dimensianal spline
-        'clusters' - allows to calculate formation energies of clusters
-        'diff' - difference of energies in meV, and volumes A^3; E(id) - E(b_id)
-        )
-    voronoi - True of False - allows to calculate voronoi volume of impurities and provide them in output. only if lammps is installed
-    b_id - key of base calculation (for example bulk cell), used in several regimes; 
-    r_id - key of reference calculation; defines additional calculation (for example atom in vacuum or graphite to calculate formation energies); can contain directly the energy per one atom
-
-    up - controls if to download files from server
-    readfiles - define if files to be readed at all or only additional analysis is required
-
-    The next three used for 'clusters' regime:    
-    imp1 - key of bulk cell with one imp1
-    imp2 - key of bulk cell with one imp2
-    matr - key of bulk cell with pure matrix.
-
-
-    show - list, allows to show additional information (force)
-
-    energy_ref - energy in eV; substracted from energy diffs
-
-    """
-    if type(show) == str:
-        show = [show]
-    if type(verlist) == int: #not in [tuple, list]:
-        #print "verlist"
-        verlist = [verlist]; 
-    if type(setlist) == str: #not in [tuple, list,]:
-        setlist = [setlist]
-    if not calc:
-        calc = header.calc
-
-    """Copying files from server"""
-    #to make
-    # for inputset in setlist:
-    #     for v in verlist:
-    #         cl = calc[(it,inputset,v)]
-    #         if not exists: 
-
-
-
-
-
-    #print verlist
-    if typconv == '': pass
-    else: setlist = varset[setlist[0]].conv[typconv] #
-
-
-    n = 'temp'; conv[n] = []
-    base = 'base'; conv[base] = []
-    conv[it] = []
-    #print calc[b_id]
-
-    emin = 0
-    if len(b_id) == 3: # for all cases besides e_seg and coseg for wich b_id is determined every iteration
-        # print "Start to read ", b_id
-        if '4' not in calc[b_id].state:
-            calc[b_id].read_results(1)
-        e_b = calc[b_id].energy_sigma0
-        v_b = calc[b_id].end.vol
-
-    #define reference values
-    e1_r = 0
-    if type(r_id) in (float, int):
-        e1_r = r_id
-    elif type(r_id) == tuple:
-        if '4' not in calc[r_id].state:
-            print "start to read reference:"
-            print calc[r_id].read_results(1)
-            # print calc[r_id].read_results()
-        e_r = calc[r_id].energy_sigma0 #reference calc
-        nat_r = calc[r_id].end.natom # reference calc
-        e1_r = e_r/nat_r # energy per one atom
-        # print e1_r
-
-
-    """Main loop"""
-    final_outstring = 'no calculation found'
-    for inputset in setlist:
-        for v in verlist:
-            # print 'Starting loops'
-
-            id = (it,inputset,v)
-
-            if id not in calc:
-                print "Calculation does not exist!!!" 
-                continue #pass non existing calculations
-
-            cl = calc[id]
-            if not hasattr(cl,'version'):
-                calc[id].version = v
-
-
-
-            path_to_contcar = cl.dir+str(v)+".CONTCAR"
-            path_to_outcar = cl.dir+str(v)+".OUTCAR"
-            path_to_xml   = cl.dir+str(v)+".vasprun.xml"
-            # print path_to_contcar, path_to_outcar
-            # print os.path.exists(path_to_contcar)
-            # print os.path.exists(cl.path["output"])
-
-            outst = ' File was not read '
-            if readfiles:
-                if  os.path.exists(path_to_outcar) and os.path.exists(path_to_xml):
+            elif job_in_queue:
                 
-                    outst = calc[id].read_results(up, analys_type, voronoi, show)
-                
-                else:
-                    print "Trying to download OUTCAR and CONTCAR from server\n\n"
-                    outst = calc[id].read_results(1, analys_type, voronoi, show)
-
-
-
-
-            if analys_type in ('e_seg', 'coseg'): b_id = (b_id[0], id[1], id[2])
-            if not hasattr(cl,'energy_sigma0'):
-                print cl.name, 'is not finished!, continue; file renamed to _unfinished'
-                outcar = cl.dir+str(v)+".OUTCAR"
-                outunf = outcar+"_unfinished"
-                runBash("mv "+outcar+" "+outunf)
-
-                continue
-
-            e = calc[id].energy_sigma0
-            try:
-                v = calc[id].end.vol
-            except:
-                v = 0
-            #print e
-            if e < emin: emin = e; id_min = id
-            conv[n].append(id)
-            # print base
-            conv[base].append(b_id)
-
-
-            outst2 = ("%s"%calc[id].name).ljust(22)
-            outst2+='&'
-            # print outst2+'&'            
-            outst_end = '' 
-            
-            if   b_id :
-
-                if "4" not in calc[b_id].state:    
-                    calc[b_id].read_results(1)
-
-                if calc[id].set.ngkpt != calc[b_id].set.ngkpt:
-                    print_and_log("Warning! you are trying to compare calcs with "+str(calc[id].set.ngkpt)+" and "+str(calc[b_id].set.ngkpt)+"\n")
-                    pass
-
-                if calc[id].NKPTS != calc[b_id].NKPTS:
-                    print_and_log("Warning! you are trying to compare calcs with "+str(calc[id].NKPTS)+" and "+str(calc[b_id].NKPTS)+" kpoints \n")
-
-                if 'gbe' in analys_type:      
-                    outst2 = gb_energy_volume(calc[id], calc[b_id])
-            
-                elif 'e_imp' in analys_type:
-                    calc[id].e_imp = e - e_b
-                    calc[id].v_imp = v - v_b
-
-                    #calc[id].v_imp = e - e_b
-                    outst2 += ("%.3f & %.2f  & %.2f &"% (e - e_b, v - v_b, (v - v_b)/v_b*100 ) )
-                    conv['e_imp'].append(id)
-                    a    = calc[id].hex_a;                     a_b  = calc[b_id].hex_a
-                    c    = calc[id].hex_c;                     c_b  = calc[b_id].hex_c
-                    ca = c/a;                                   ca_b = c_b/a_b
-                    outst_end = " & {0:.1f} & {1:.1f} & {2:.1f} & {3:.3f}".format((a - a_b)/a_b*100,  (c - c_b)/c_b*100, (ca - ca_b)/ca_b*100, (e - e_b - e1_r) )
-
-                elif analys_type == 'e_2imp': #"""For calculation of energies of two impurities in big cell"""
-                    calc[id].e_imp = e - e_b            
-                    outst2 += ("%.0f "% ( (e - e_b)*1000 ) )  
-                    conv[it].append(id)
-
-                elif analys_type in ('e_seg', 'coseg', 'diff'): #"""For calculation of segregation and cosegregation energies"""
-                    
-
-                    
-                    e_b = calc[b_id].energy_sigma0
-                    v_b = calc[b_id].end.vol
-
-
-                    # outst2 += ("%.0f & %.2f "% ( (e - e_b)*1000, v - v_b ) )
-                    
-                    outst2 += " {:.0f} & {:.2f} ".format( (e - e_b - energy_ref)*1000, (v - v_b) ).center(6)
-                    outst2 +='&'
-                    # write_xyz(calc[id].end)
-                    # write_xyz(calc[b_id].end)
-                
-
-            if analys_type == 'clusters':
-                e1  = calc[imp1].energy_sigma0
-                e2  = calc[imp2].energy_sigma0
-                e_m = calc[matr].energy_sigma0
-                n1 = calc[id].init.nznucl[1]
-                if len(calc[id].init.nznucl) == 3:
-                    n2 = calc[id].init.nznucl[2]
-                else:
-                    n2 = 0
-                # print n1,n2
-                outst2 += ("%.0f "% ( (e - n1*e1 - n2*e2 + (n1+n2-1)*e_m )*1000 / (n1+n2) ) )
-            
-
-
-            final_outstring = outst2+outst + outst_end              
-            print final_outstring
-
-        emin = 0
-        
-
-
-
-
-
-        """Aditional analysis, plotting"""
-        if '4' not in calc[id].state:
-            print "Calculation ",id, 'is unfinished;return'
-            return
-        final_list = () #if some part fill this list it will be returned instead of final_outstring
-        if analys_type == 'gbe':
-            print("\nGrain boundary energy and excess volume fit:")
-            plot_conv( conv[n], calc, "fit_gb_volume")
-
-        elif analys_type == 'gbep':
-            print("\nGrain boundary energy and excess volume fit:")
-            # plot_conv( conv[n], calc, "fit_gb_volume")
-            final_outstring = plot_conv( conv[n], calc, "fit_gb_volume_pressure")
-
-        elif analys_type in ('e_seg', 'coseg') and len(verlist) > 3:
-
-            #Test lateral sizes
-            A   = calc[id].end.yzarea
-            A_b = calc[b_id].end.yzarea
-            
-            if A != A_b: 
-                print_and_log("Warning! you are trying to compare calcs with different lateral sizes: "+str(A)+" "+str(A_b))
-                print "Areas are ", A, A_b," A^3"
-            
-            #Show results 
-            id1 = (it,inputset,verlist[0]) #choosen to save calculated values at first version of version set
-            
-            if readfiles and plot:           
-                #print " \n\nImpurity at the interface :"
-                e, v, emin, vmin       = plot_conv( conv[n], calc,  "fit_gb_volume2")
-                #print " \n\nImpurity in the volume    :"
-                e_b, v_b, e_bmin, v_bmin = plot_conv( conv[base], calc, "fit_gb_volume2")
-                e_segmin = (emin - e_bmin) * 1000
-                v_segmin =  vmin - v_bmin
-
-
-                e_seg = (e - e_b) * 1000
-                v_seg =  v - v_b
-
-                calc[id1].e_seg = e_seg
-                calc[id1].v_seg = v_seg
-            
-            if not hasattr(calc[id1], 'e_seg'): 
-                print "Warning! Calculation ", id1, 'does not have e_seg and v_seg. Try to run with readfiles = True to calculate it.'
-                calc[id1].e_seg = 0; calc[id1].v_seg = 0
-            
-
-
-            natom = calc[id1].natom
-            calc[id1].X = 1./natom
-            v1 = v / natom
-            calc[id1].Xgb = v1 / A # for grain boundary with 1 A width. For other boundaries should be divided by width. 
-            #print ("__________________________________________________________________________")
-            
-            #print (" At zero pressure: segregation energy is %.0f  meV; Seg. volume is %.1f A^3; excess seg. vol. is %.2f A" %(e_seg, v_seg, v_seg/A ) )
-            # print ("%s.fit.pe & %.0f & %.1f & %.2f & %.3f & %.1f" %(id[0]+'.'+id[1], e_seg, v_seg, v_seg/A, 1./A, 1./calc[id].natom * 100  ) )
-            
-            #Calculate distance from impurity to boundary and number of neighbours for version 2!
-            id2 =(it,inputset, 2)
-            st = calc[id2].end
-            gbpos2 = calc[id2].gbpos 
-            gbpos1 = gbpos2 - st.rprimd[0][0]/2.
-            d1 = abs(st.xcart[-2][0] - gbpos2)
-            d2 = abs(st.xcart[-1][0] - gbpos2)
-            dgb = d1; 
-            iimp = -2
-            if d2 < d1: 
-                dgb = d2
-                iimp = -1
-            t = st.typat[iimp]
-            z = st.znucl[t-1]
-            segimp = element_name_inv(z) #Type of impurity closest to gb
-            # print segimp, d
-
-            id_m2   = (it+'.m',      '8'+inputset[1:], 2)
-            
-            if analys_type == 'e_seg':
-
-                #calc e_seg2 and decomposition to mechanical and chemical contributions
-
-                if id_m2 in calc: #additional analysis
-                    b_id2 = (b_id[0],inputset, 2)
-                    b_id_m2 = (b_id[0]+'.m', '8'+inputset[1:], 2)
-
-                    e_seg2 = (calc[id2].energy_sigma0 - calc[b_id2].energy_sigma0) * 1000
-                    e_m2   = (calc[id_m2].energy_sigma0 - calc[b_id_m2].energy_sigma0) * 1000
-                    e_ch2  = e_seg2 - e_m2
-                else:
-                    e_seg2 = 0
-                    e_m2   =0
-                    e_ch2  =0
-
-
-                #calculate number of close neibours around closest to gb imp
-                x_central = st.xcart[iimp]
-                st_r  = replic(st,   mul = (1,2,2), inv =  1 )
-                st_rr = replic(st_r, mul = (1,2,2), inv = -1 ) # to be sure that impurity is surrounded by atoms
-
-                dmax = 3
-                list = [ x  for x, t  in zip(st_rr.xcart, st_rr.typat) if np.linalg.norm(x_central - x) < dmax and t == 1]
-                nneigbours =  len(list)
-
-
-                final_outstring = ("%s.fit.pe & %.0f & %.1f & %.2f & %.d & %4.0f & %4.0f & %4.0f & %s " %(
-                    id2[0]+'.'+id2[1], calc[id1].e_seg, calc[id1].v_seg, dgb, nneigbours, e_seg2, e_ch2, e_m2, segimp  ))
-
-                # final_outstring = ("%s.fit.pe & %.0f & %.0f & %.1f & %.1f & %.2f & %.d & %4.0f & %4.0f & %4.0f & %s " %(
-                #     id2[0]+'.'+id2[1], calc[id1].e_seg, e_segmin, calc[id1].v_seg, v_segmin , dgb, nneigbours, e_seg2, e_ch2, e_m2, segimp  )) #e_segmin and v_segmin are minimum energy (but at some pressure) and corresponing volume
-
-
-
-                final_list = [id2[0]+'.'+id2[1], calc[id1].e_seg, calc[id1].v_seg, dgb, nneigbours, e_seg2, e_ch2, e_m2, segimp]
-            
-            elif analys_type == 'coseg' :
-                calc[id2].e_seg = calc[id1].e_seg #save in version 2
-                calc[id2].v_seg = calc[id1].v_seg
-                final_outstring = ("%s.fit.pe & %.0f & %.1f & %.1f & %.1f" %(id[0]+'.'+id[1], calc[id2].e_seg, calc[id2].v_seg, d1, d2 ))
-
-
-
-
-            print  final_outstring
-            print '\\hline'
-
-
-        elif analys_type == 'e_2imp':
-            # plot_conv( conv[it], calc,  analys_type, conv_ext) #instead use plot_conv( conv['hs443OO'], calc,  'e_2imp', [conv['hs443CO'],conv['hs443CC']]) 
-            pass
-
-
-
-        elif analys_type == 'fit_ac':
-            #for x in calc[id_min].end.xred:
-            #    print x[0], x[1], x[2]
-            #print ( outst2 + " min_e & "+calc[id_min].read_results(v,) )
-            #print ("name %s_template          acell  %.4f  %.4f  %.4f # fit parameters are &%.4f &%.4f &%i &%i"  % (fit_hex(0.0002,0.0003,400,600, it, inputset, verlist, calc) )  )    
-            print ("name %s_template          acell  %.5f  %.5f  %.5f # fit parameters are &%.5f &%.5f &%i &%i"  % (fit_hex(0.00002,0.00003,4000,6000, it, inputset, verlist, calc) )  )    
-            #name, e_min, a_min, c_min,a,b,c,d = fit_hex(0.0002,0.0003,400,600, it, inputset, verlist, calc)
-            #calc[(name,'93',1)].energy_sigma0 = e_min
-            #calc[(name,'93',1)].state = "4"
-
-        elif analys_type == 'dimer':
-            """Fit of md steps obtained from constant speed; see vasp description for dimer"""
-            # print calc[id].list_e_sigma0
-            # calc[id].list_dE = []
-            # for E in calc[id].list_e_without_entr:
-
-            #     calc[id].list_dE.append(E - 2*calc[b_id].e_without_entr)
-
-            # print calc[id].list_e_without_entr
-            # print calc[id].list_dE
-            calc[id].e_ref = calc[b_id].e_without_entr
-
-            plot_conv( [id], calc,  "dimer")
-
-    if final_list:
-        return final_list
-    else:
-        return final_outstring.split('&') # only for last version or fit depending on type of analysis
-
-def inherit_icalc(inherit_type, it_new, ver_new, id_base, calc, 
-    id_from = None,
-    atom_new = None, atom_to_replace = None,  used_cell = 'end'):
-    """
-    Function for creating new geo files in geo folder based on different types of inheritance
-    Input: it_new - name of new structure,
-    id_base - new structure will be based on the final structure of this calculation,
-    it_from - can be additionally used to adopt for example rprimd from id_from to it_new
-
-    inherit_type = ('')
-    remove_imp - removes all atoms with typat > 1
-    used_cell - use init or end of id_base. Now realized only for replace atoms 
-
-
-
-    Atoms of type 'atom_to_replace' in 'id_base' will be replaced by 'atom_new' type.
-
-    Result: new geo file in the input geo folder
-
-
-    Comments: changes len_units of new to Angstrom!!!
-    """
-
-
-    hstring = ("%s    #on %s"% (traceback.extract_stack(None, 2)[0][3],   datetime.date.today() ) )
-    if hstring != header.history[-1]: header.history.append( hstring  )
-
-    #if inherit_type not in header.history[-1] or \
-    #it_new not in header.history[-1]:   header.history.append( hstring  )
-
-    if id_from:
-        if type(id_from) == str: # if string - treated like file name
-            calc_from = CalculationVasp();
-            calc_from.read_geometry(id_from)
-            calc_from.end = calc_from.init
-            calc_from_name = id_from
-        else:
-            print "id_from", id_from
-            calc_from = calc[id_from]
-            calc_from_name = calc_from.name
-
-        if calc[id_base].len_units != calc_from.len_units:
-            print_and_log("Calculations have different len_units"); raise RuntimeError
-
-
-
-        if it_new == id_from[0] and ver_new == id_from[2]:
-            print_and_log("Warning! check your versions, you are trying to overwrite existing from structures, nothing done")
-            raise RuntimeError 
-
-
-    if it_new == id_base[0] and ver_new == id_base[2]:
-        print_and_log("Warning! check your versions, you are trying to overwrite existing base structures, nothing done")
-        raise RuntimeError
-  
-
-
-    new = copy.deepcopy(  calc[id_base]  )
-
-    new.len_units = 'Angstrom' #! Because from VASP
-
-
-    new.path["input_geo"] = geo_folder + struct_des[it_new].sfolder + '/' + \
-        it_new+"/"+it_new+'.inherit.'+inherit_type+'.'+str(ver_new)+'.'+'geo'
-    print new.path["input_geo"]
-    new.version = ver_new
-
-    if inherit_type == "r2r3":
-        des = ' Partly inherited from the final state of '+calc[id_base].name+'; r2 and r3 from '+calc_from_name
-        new.des = struct_des[it_new].des + des
-        new.end.rprimd[1] = calc_from.end.rprimd[1].copy()
-        new.end.rprimd[2] = calc_from.end.rprimd[2].copy()       
-        new.write_geometry("end",des)
-
-    elif inherit_type == "r1r2r3":
-        des = ' Partly inherited from the final state of '+calc[id_base].name+'; r1, r2, r3 from '+calc_from_name
-        new.des = struct_des[it_new].des + des
-        new.end.rprimd = copy.deepcopy( calc_from.end.rprimd )
-        new.hex_a = calc_from.hex_a
-        new.hex_c = calc_from.hex_c
-        new.end.xcart = xred2xcart(new.end.xred, new.end.rprimd) #calculate new xcart from xred, because rprimd was changed
-        new.write_geometry("end",des)
-
-
-    elif inherit_type == "full":
-        print_and_log("Warning! final xred and xcart was used from OUTCAR and have low precision. Please use CONTCAR file \n");
-        des = 'Fully inherited from the final state of '+calc[id_base].name
-        new.des = des + struct_des[it_new].des
-        new.write_geometry("end",des)
-
-    elif inherit_type == "remove_imp":
-        """
-        Assumed that typat == 1 is matrix atoms
-        """
-        des = 'All impurities removed from the final state of '+calc[id_base].name
-        new.des = des + struct_des[it_new].des
-     
-        st = calc[id_base].end
-        new.end.typat = []
-        new.end.xred = []
-        new.end.xcart = []
-        new.end.ntypat = 1
-        new.end.znucl = new.end.znucl[0:1]
-        for i, t in enumerate(st.typat):
-            if t == 1:
-                new.end.typat.append(t)
-                new.end.xred.append(st.xred[i])
-                new.end.xcart.append(st.xcart[i])
-        new.end.natom = len(new.end.xred)
-        new.init = new.end #just for sure
-        new.write_geometry("end",des)        
-
-
-    elif inherit_type == "replace_atoms":
-        """Simply replace in calculation one atoms by another """
-        z_new     = element_name_inv(atom_new)
-        z_replace = element_name_inv(atom_to_replace)
-
-
-        if used_cell == 'init':
-            st = new.init
-        elif used_cell == 'end':
-            st = new.end
-
-
-        znucl = st.znucl
-        
-        if z_replace not in znucl: 
-            print "Error! Calc "+new.name+" does not have atoms of this type\n"
-            raise RuntimeError
-
-        if atom_to_replace not in id_base[0] or atom_new not in it_new:
-            print "Error! Something wrong with names of atom types\n"
-            raise RuntimeError            
-        print "replace ", z_replace, "by", z_new
-
-        znucl = [int(z) for z in znucl] # convert to int
-        i_r = znucl.index(z_replace)
-        print "index ", i_r
-        znucl[i_r] = z_new
-
-        if znucl[-2] == znucl[-1]: #just for special case
-            del znucl[-1]
-
-            for i, t in enumerate(st.typat):
-                if t == st.ntypat:
-                    print "found ntypat" ,t
-                    st.typat[i]-=1
-                    #print t
-            st.ntypat-=1
-            #print st.typat
-            #print new.end.typat
-        
-        st.znucl = znucl
-
-
-
-        des = 'Fully inherited from the '+ used_cell +' state of '+calc[id_base].name+\
-        ' by simple replacing of '+atom_to_replace+' by '+atom_new
-
-        new.des = des + struct_des[it_new].des
-        new.write_geometry(used_cell, des)
-
-    else:
-        print_and_log("Error! Unknown type of Calculation inheritance"); raise RuntimeError
-    return
-
-
-
-
-
-
-
-def for_phonopy(new_id, from_id = None, calctype = 'read', mp = [10, 10, 10], additional = None):
-    #creates file for phonopy, run phonopy
-    #new_id - will add this calculation or read; if string then interpreted as filename of thermal_properties.yaml
-    #from_id - tuple - than will take coordinates from the end; or path to input poscar file
-    #type - 'create', 'read'
-    #additional - list of calculation names, if calculation was splited into several parts
-
-    mpstr = " ".join(map(str, mp))
-
-    def read_phonopy_data(filename, key = "free_energy" ):
-        # with open(filename, 'r') as f:
-        #     f.readline()
-        F = []
-        T = []
-        #     for line in f:
-        #         T.append(float(line.split()[0]))
-        #         F.append(float(line.split()[1]))
-        #     # print T, F
-        import yaml
-        f = open(filename)
-        # use safe_load instead load
-        dataMap = yaml.safe_load(f)
-        f.close()
-        prop = dataMap['thermal_properties']
-        for i in range(len(prop)):
-            T.append( prop[i]['temperature'] )
-            F.append( prop[i][key]     )
-
-        coeffs1 = np.polyfit(T, F, 8)
-        fit_func = np.poly1d(coeffs1)
-        T_range = np.linspace(min(T), max(T))
-        print 'I return', key
-
-        return T_range, fit_func
-
-
-
-
-    if calctype == 'create':
-        work_path = 'geo/'+struct_des[new_id[0]].sfolder+'/'+new_id[0]
-    
-        log_history(  "{:}    #on {:}".format( traceback.extract_stack(None, 2)[0][3],   datetime.date.today() )  )
-
-        print type(from_id)
-        if type(from_id) == str:
-            from_cl = CalculationVasp()
-            from_cl.read_poscar(from_id)
-            state = 'init'
-            from_st = from_cl.init
-        else:
-            from_cl = header.calc[from_id]
-            state = 'end'
-            from_st = from_cl.end
-
-            # print  header.varset
-            #create POSCAR
-        posname = 'phonopy_input_poscar'
-        from_cl.write_structure(name_of_output_file = posname, path = work_path, state = state)
-
-        savedPath = os.getcwd()
-        os.chdir(work_path)
-        #create conf 
-        confname = new_id[0]+'.conf'
-        with open(confname, 'w') as f:
-            f.write("DIM = 1 1 1\n")
-            f.write("ATOM_NAME = ")
-            for z in from_st.znucl:
-                el = element_name_inv(z)
-                f.write(el+' ')
-            f.write("\nDIAG = .TRUE.\n")
-            f.write("DISPLACEMENT_DISTANCE = 0.03\n")
-
-         
-        #run phonopy
-        print runBash('export PYTHONPATH=~/installed/phonopy-1.9.5/lib/python:$PYTHONPATH; rm POSCAR-*; /home/dim/installed/phonopy-1.9.5/bin/phonopy '
-            +confname+' -c '+posname+' -d --tolerance=0.01')
-
-        ndis = len( glob.glob('POSCAR-*') )
-        print ndis, ' displacement files was created'
-
-        os.chdir(savedPath)
-
-
-        #add
-        add_loop(new_id[0],   new_id[1], range(1,ndis+1), up = 'up1', input_geo_format = 'vasp', savefile = 'allx')
-
-        #copy SPOSCAR - an ideal cell
-        src =  'geo/'+struct_des[new_id[0]].sfolder+'/'+new_id[0]
-        dst = struct_des[new_id[0]].sfolder+'/'+new_id[0]+'.'+new_id[1]+'/'
-        shutil.copy(src+'/SPOSCAR', dst)
-        shutil.copy(src+'/disp.yaml', dst)
-
-    if calctype == 'read':
-
-        if type(new_id) == tuple:
-            new_cl = header.calc[new_id]
-
-            work_path = struct_des[new_id[0]].sfolder+'/'+new_id[0]+'.'+new_id[1]
-            work_path_geo = 'geo/'+struct_des[new_id[0]].sfolder+'/'+new_id[0]
-
-
-
-            npos = len( glob.glob(work_path+'/*.POSCAR') )
-            print range(1,npos+1), 'range'
-            if not os.path.exists(work_path+"/1.POSCAR"):
-                res_loop(new_id[0],   new_id[1], range(1,npos+1), up = 'up1', input_geo_format = 'vasp', savefile = 'allx')
-
-            if additional:
-                for name in additional:
-                    npos_new = len( glob.glob(struct_des[new_id[0]].sfolder+'/'+name+'.'+new_id[1]+'/*.POSCAR') )
-
-                    if not os.path.exists(struct_des[new_id[0]].sfolder+'/'+name+'.'+new_id[1]+'/'+str(npos+1)+".POSCAR"):
-                        res_loop(name,   new_id[1], range(npos+1, npos+npos_new+1), up = 'up1', input_geo_format = 'vasp', savefile = 'allx')
-                    
-                    npos = npos+npos_new
-
-                    runBash("rsync "+struct_des[new_id[0]].sfolder+'/'+name+'.'+new_id[1]+'/*.vasprun.xml '+work_path)
-                    # print 'Additional vasprun.xml files were copied to ', work_path
-
-            savedPath = os.getcwd()
-            os.chdir(work_path)
-
-
-            #create conf 
-            confname = new_id[0]+'_mesh.conf'
-            with open(confname, 'w') as f:
-                f.write("DIM = 1 1 1\n")
-                f.write("ATOM_NAME = ")
-                for z in new_cl.end.znucl:
-                    el = element_name_inv(z)
-                    f.write(el+' ')
-                f.write("\nMP = {:}\n".format( mpstr ))
-                f.write("\nTSTEP = {:}\n".format( 1 ))
-                f.write("\nTMAX = {:}\n".format( 1155 ))
-
-            if not os.path.exists("FORCE_SETS"):
-                #run phonopy; read forces
-                ndis = len( glob.glob('*.vasprun.xml') )
-                print ndis, ' displacement files was Found'
-                print runBash('export PYTHONPATH=~/installed/phonopy-1.9.5/lib/python:$PYTHONPATH; /home/dim/installed/phonopy-1.9.5/bin/phonopy '
-                    +'  -f {1..'+str(ndis)+'}.vasprun.xml --tolerance=0.01')
-
-            #calculate thermal prop
-            result = 'thermal_properties_'+mpstr.replace(" ", "_")+'.yaml'
-            if not os.path.exists(result):
-
-                posname = 'SPOSCAR'
-                print runBash('export PYTHONPATH=~/installed/phonopy-1.9.5/lib/python:$PYTHONPATH; /home/dim/installed/phonopy-1.9.5/bin/phonopy '
-                    +confname+' -c '+posname+' -t -p -s --tolerance=0.01')
-
-                shutil.copyfile('thermal_properties.yaml', result)
-    
-
-            T_range, fit_func = read_phonopy_data(result)
-
-            os.chdir(savedPath)
-
-        if type(new_id) == str:
-            result = new_id
-            T_range, fit_func = read_phonopy_data(result)
-
-
-
-    return T_range, fit_func
-
-
-
-
-
-
-
-
-
-#Deprecated classes, needed only for compatibility
-class DataStuff:
-    """Parent Class For reading data and manipulate"""
-    def do(self,command):
-        self.s = runBash(command)
-        ch = re.compile('[a-zA-Z]+') # make object , matched anything other than digit
-        #find first entrance of any word
-        try:
-            w = ch.match(self.s).group()
-            self.sdig = self.s.replace(w, '')#delete
-            self.sv =  self.sdig.split() #values but like strings
-            self.v = []
-            for i in range(len(self.sv)):
-                self.v.append(float(self.sv[i]))  
-        except AttributeError:
-            self.sdig = self.s
-                
+                cl.state = '3. In queue'
        
-class CartArray(DataStuff):
-    "Objects of this class will storage lists of 3 cartesian components, like list of atoms coordinates "
-    def __init__(self):
-        self.x = []
-        self.y = []
-        self.z = []
-        self.r = []
-    def do(self,command):
-        DataStuff.do(self,command)
-        if not self.sdig == '':
-            lines = self.sdig.splitlines() #divide xcart string by lines
-            for i in range(len(lines)):
-                w = lines[i].split() #divide each line on components 
-                if not len(w) == 3: 
-                    print "Too many components, check sdig attribute - allowed only 3"
-#                print self.s
+            else:
+                ''
+                if '3' in cl.state:
+                    cl.state = '2. Unknown'
+
+        else:
+            cl.state = '2. Unknown'
+
+
+
+
+        return cl.state 
+
+
+
+
+    def res(self, **argv):
+        from calc_manage import res_loop
+        res_loop(*self.id, **argv)
+
+    def run(self, ise, iopt = 'full_nomag', up = 'up1', vers = None, i_child = -1, add = 0, *args, **kwargs):
+        """
+        Wrapper for add_loop (in development)
+        By default inherit self.end
+        ise - new ise
+
+        iopt - inherit_option
+            'full_nomag'
+            'full'
+            'full_chg' - including chg file
+        vers - list of version for which the inheritance is done
+
+        i_child - choose number of child to run res_loop()
+        add - if 1 than add new calculation irrelevant to children
+        TODO:
+        1. if ise is not provided continue in the same folder under the same name,
+        however, it is not always what is needed, therefore use inherit_xred = continue
+        """
+
+        from calc_manage import add_loop
+
+        if not iopt:
+            iopt = 'full'
+
+
+
+        # if self.id[1] != ise:
+        if 1:
+            if not hasattr(self, 'children'):
+                self.children = []
+
+            if not add and len(self.children)>0:
+                print('Children were found:', self.children, 'by defauld reading last, choose with *i_child* ')
                 
+                for i in self.children:
+                    # print(i, ise, i[1], i[1] == ise)
+                    if i[1] == ise:
+                        idd = i
+                        # add = True
+                        break
+
+                else:
+                    add = True
+                    # idd  = self.children[i_child]
+                # print(idd)
+
+                cl_son = header.calc[idd]
                 
-                x = float(w[0]); y = float(w[1]); z = float(w[2]);
-                self.x.append(x)
-                self.y.append(y)
-                self.z.append(z)
-                self.r.append( math.sqrt(x*x + y*y + z*z) )
+                cl_son.res(up = up, **kwargs)
+                child = idd
+            
+
+            vp = header.varset[ise].vasp_params
+            ICHARG_or = 'impossible_value'
+            if add or len(self.children) == 0:
+                
+
+                if iopt  == 'full_chg':
+                    if 'ICHARG' in vp and vp['ICHARG'] != 1:
+                        printlog('Warning! Inheritance of CHGCAR and ICHARG == 0; I change locally ICHARG to 1')
+                        ICHARG_or = vp['ICHARG']
+                        vp['ICHARG'] = 1
+
+
+                if not vers:
+                    vers = [self.id[2]]
+
+                idd = self.id
+                it_new = add_loop(idd[0],idd[1], vers, ise_new = ise, up = up, inherit_option = iopt, override = 1, *args, **kwargs)
+                # it_new = add_loop(*self.id, ise_new = ise, up = up, inherit_option = iopt, override = 1)
+                child = (it_new, ise, self.id[2])
+
+                if child not in self.children:
+                    self.children.append(child)
+
+
+                if ICHARG_or != 'impossible_value':
+                    vp['ICHARG'] = ICHARG_or  #return original value
+ 
+
+        return header.calc[child]
+
+
+    def read_pdos_using_phonopy(self, mode = 'pdos', plot = 1):
+        """
+        mode - 
+            pdos
+            band
+            free - thermal properties
+        """
+
+        if plot == 1:
+            p = ' -p '
+        else:
+            p = ''
+
+        from calc_manage import create_phonopy_conf_file, read_phonopy_data
+
+        self.get_chg_file('vasprun.xml', nametype = 'asoutcar')
+        create_phonopy_conf_file(self.end, mp = [10, 10, 10], path = self.dir)
+        # create_phonopy_conf_file(self.end, mp = [36, 36, 36], path = self.dir) #almost no difference was found for Na2X
+        create_phonopy_conf_file(self.end, path = self.dir, filetype = 'band') #create band file
 
 
 
+        cwd = os.getcwd()
+
+        os.chdir(self.dir)
+        runBash('phonopy --fc '+os.path.basename(self.path['xml']))
+
+        if 'poscar' not in self.path:
+            self.path['poscar'] = self.path['output'].replace('OUTCAR','POSCAR')
+
+        if mode == 'pdos':
+            print('phonopy -c '+os.path.basename(self.path['poscar'])+p+'  mesh.conf --readfc ')
+            runBash('phonopy -c '+os.path.basename(self.path['poscar'])+p+' mesh.conf --readfc ')
+
+        from calc_manage import read_phonopy_dat_file
+
+        self.pdos = read_phonopy_dat_file('total_dos.dat')
 
 
+        #phonons
+        
+
+        if mode == 'band':
+            print('phonopy -c '+os.path.basename(self.path['poscar'])+' -p band.conf --readfc ')
+            runBash('phonopy -c '+os.path.basename(self.path['poscar'])+' -p band.conf --readfc ')
+
+        if mode == 'free':
+            print('phonopy -c '+os.path.basename(self.path['poscar'])+' -t -p mesh.conf --readfc ')
+
+            runBash('phonopy -c '+os.path.basename(self.path['poscar'])+' -t' +p+' mesh.conf --readfc ')
 
 
+            Trange, func = read_phonopy_data('thermal_properties.yaml', convert = 1)
 
+            self.F = func # free energy function in eV, still for the whole supercell!
+            # print(self.id, self.F)
+
+
+        os.chdir(cwd)
+
+        return

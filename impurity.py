@@ -1,15 +1,24 @@
+from __future__ import division, unicode_literals, absolute_import 
 
-from header import *
-import header
-from classes import CalculationVasp, InputSet, Structure
-from functions import image_distance, xred2xcart, xcart2xred, write_xyz, replic, return_atoms_to_cell, element_name_inv
+
 import ctypes
+from tabulate import tabulate
 #from ctypes import *
 from ctypes import cdll
 from ctypes import c_float, byref
 
-# import os
-# print os.getcwd()
+import numpy as np
+import traceback, os, sys, datetime, glob, copy
+
+
+from header import print_and_log, printlog, geo_folder, runBash
+import header
+from classes import CalculationVasp, Structure
+from set_functions import InputSet
+from functions import  return_atoms_to_cell, element_name_inv
+from inout import write_xyz
+
+from geo import local_surrounding, local_surrounding2
 
 lib = cdll.LoadLibrary(os.path.dirname(__file__)+'/libfindpores.so')
 
@@ -24,7 +33,8 @@ def find_pores(st_in, r_matrix=1.4, r_impurity = 0.6, step_dec = 0.05, fine = 0.
     find_close_to = (), check_pore_vol = 0):
     """
     st_in - input Structure() object
-    r_impurity - all pores smaller than this radius will be found
+    r_impurity (A)- all pores smaller than this radius will be found
+    r_matrix (A) - radius of matrix atoms disregarding to their type
     step_dec - scanning step of the cell in Angstroms
     fine - allows to change density of local points; local_step = step_dec/fine
     prec - precicion of pore center determination
@@ -67,6 +77,7 @@ def find_pores(st_in, r_matrix=1.4, r_impurity = 0.6, step_dec = 0.05, fine = 0.
 
     """----Run C++ function"""
     print_and_log("Starting C++ function lib.findpores()...\n")
+    # print(r_matrix, r_impurity, step_dec, fine, prec)
     lib.findpores ( check_pore_vol, \
                     max_npores, \
                     byref(ntot),   l_pxred1, l_pxred2, l_pxred3, l_npores, \
@@ -75,8 +86,8 @@ def find_pores(st_in, r_matrix=1.4, r_impurity = 0.6, step_dec = 0.05, fine = 0.
                     c_float(r_matrix), c_float(r_impurity), c_float(step_dec), c_float(fine), c_float(prec), \
                     r1, r2, r3 )
 
-    print "ntot is ", ntot.value
-    print "l_npores[0] is ",l_npores[0]
+    print_and_log( "ntot is ", ntot.value)
+    print_and_log( "l_npores[0] is ",l_npores[0])
 
     v = np.zeros((3))
     l_pxred = []
@@ -94,7 +105,8 @@ def find_pores(st_in, r_matrix=1.4, r_impurity = 0.6, step_dec = 0.05, fine = 0.
 
 
 
-    if shift2 != ntot.value: print "Error! final shift2 not equal to ntot"
+    if shift2 != ntot.value: 
+        print_and_log( "Error! final shift2 not equal to ntot")
 
     #print l_pxred[0]
 
@@ -109,13 +121,16 @@ def find_pores(st_in, r_matrix=1.4, r_impurity = 0.6, step_dec = 0.05, fine = 0.
 
 
     """ Analyse of pores """
-    st_result = Structure()
+    # st_result = Structure()
+    st_result = st_in.new()
+
+
     st_result.rprimd = rprimd
  
     targetp = np.array((0.,0.,0.))
     if find_close_to: 
         targetp = np.asarray(find_close_to) #targer point
-        print "Target point is                        ",targetp
+        print_and_log( "Target point is                        ",targetp)
  
     a = step_dec/fine #the side of little cube formed by the mesh which is used to find spheres inside the pore.
     aaa = a*a*a
@@ -132,7 +147,7 @@ def find_pores(st_in, r_matrix=1.4, r_impurity = 0.6, step_dec = 0.05, fine = 0.
             if d < d_min and x[0] <= 0.5 and x[1] <= 0.5 and x[2] <= 0.5:
                 d_min = d
                 x_min = x
-        print "The closest pore to the center has coordinates",x_min
+        print_and_log( "The closest pore to the center has coordinates",x_min)
         st_result.xred.append( x_min )
 
 
@@ -164,16 +179,16 @@ def find_pores(st_in, r_matrix=1.4, r_impurity = 0.6, step_dec = 0.05, fine = 0.
             #    i2_min = i
 
         #print "rprimd[0][0]", rprimd[0][0]
-        print "Position of boundary is ",gbpos/rprimd[0][0]
+        print_and_log( "Position of boundary is ",gbpos/rprimd[0][0])
      
         #x_min[0] = gbpos/rprimd[0][0]
-        if find_close_to: print "The closest pore to the target point is [ %.2f  %.2f  %.2f ]"%(x_min[0], x_min[1], x_min[2])
-        else: print "The closest pore to the gb has coordinates",x_min
+        if find_close_to: print_and_log( "The closest pore to the target point is [ %.2f  %.2f  %.2f ]"%(x_min[0], x_min[1], x_min[2]))
+        else: print_and_log( "The closest pore to the gb has coordinates",x_min)
         st_result.xred.append( x_min )
         #st_result.xred.append( x_pre )           
         #Calculate volume of the pore using local balls:
-        print "The number of pore is ",i_min," ; It has ",l_npores[i_min], "local balls"
-        print "Volume of pore is ", l_npores[i_min] * a*a*a, " A^3";
+        print_and_log( "The number of pore is ",i_min," ; It has ",l_npores[i_min], "local balls")
+        print_and_log( "Volume of pore is ", l_npores[i_min] * a*a*a, " A^3")
         #st_result.xred.extend( l_pxred[i_min] )
         #st_result.xred.extend( l_pxred[i_pre] )   
 
@@ -202,12 +217,12 @@ def find_pores(st_in, r_matrix=1.4, r_impurity = 0.6, step_dec = 0.05, fine = 0.
                 x2_min = x
                 i2_min = i
 
-        if find_close_to: print "The closest pore to the target point is [ %.2f  %.2f  %.2f ]"%(x2_min[0], x2_min[1], x2_min[2])
-        else:             print "The closest pore to the center of bulk has coordinates",x2_min
+        if find_close_to: print_and_log( "The closest pore to the target point is [ %.2f  %.2f  %.2f ]"%(x2_min[0], x2_min[1], x2_min[2]))
+        else:             print_and_log( "The closest pore to the center of bulk has coordinates",x2_min)
         st_result.xred.append( x2_min )           
         #Calculate volume of the pore using local balls:
-        print "The number of bulk pore is ",i2_min," ; It has ",l_npores[i2_min], "local balls"
-        print "Volume of pore is ", l_npores[i2_min] * a*a*a, " A^3";
+        print_and_log( "The number of bulk pore is ",i2_min," ; It has ",l_npores[i2_min], "local balls")
+        print_and_log( "Volume of pore is ", l_npores[i2_min] * a*a*a, " A^3")
         st_result.xred.extend( l_pxred[i2_min] )  
 
     elif calctype == 'all_local':
@@ -216,9 +231,9 @@ def find_pores(st_in, r_matrix=1.4, r_impurity = 0.6, step_dec = 0.05, fine = 0.
         i_max = 0
         for i in range(npores.value):
             v_pore = l_npores[i] * aaa
-            print  "Volume of pore is ", l_npores[i] * aaa, " A^3";
+            print_and_log(  "Volume of pore is ", l_npores[i] * aaa, " A^3")
             if v_pore > v_max: v_max = v_pore; i_max = i
-        print "Pore number ", i_max,"has the largest volume ", v_max," A^3"
+        print_and_log( "Pore number ", i_max,"has the largest volume ", v_max," A^3")
         # st_result.xred = l_pxred[i_max] # here coordinates of all local points to show geometry of pore with largerst volume
         st_result.xred = [x for group in l_pxred for x in group ] # all pores
 
@@ -228,8 +243,13 @@ def find_pores(st_in, r_matrix=1.4, r_impurity = 0.6, step_dec = 0.05, fine = 0.
         st_result.xred = pxred
 
 
-
-    st_result.xcart = xred2xcart(st_result.xred, rprimd)
+    st_result.rprimd = rprimd
+    st_result.xred2xcart()
+    st_result.typat = [1 for x in st_result.xred]
+    st_result.ntypat = 1
+    st_result.natom = len(st_result.typat)
+    st_result.znucl = [200]
+    st_ntypat = 1
 
     return st_result
 
@@ -238,7 +258,7 @@ def find_pores(st_in, r_matrix=1.4, r_impurity = 0.6, step_dec = 0.05, fine = 0.
 
 def add_impurity(it_new, impurity_type = None, addtype = 'central', calc = [], r_pore = 0.5,
     it_to = '', ise_to = '', verlist_to = [], copy_geo_from = "", find_close_to = (),add_to_version = 0,
-    write_geo = True, only_version = None, fine = 4, put_exactly_to = None, check_pore_vol = 0):
+    write_geo = True, only_version = None, fine = 4, put_exactly_to = None, check_pore_vol = 0, replace_atom = None, override = False):
 
     """
     Add impurities in pores.
@@ -285,10 +305,15 @@ def add_impurity(it_new, impurity_type = None, addtype = 'central', calc = [], r
 
     check_pore_vol - allows to estimate volume of pores; has problems for big cells
 
+    replace_atom - if not None, than the specified atom is substituted
+
 
     Side effects: creates new geometry folder with input structures; 
 
     """
+
+    struct_des = header.struct_des
+
     def test_adding_of_impurities(added, init, v):
         """
         Can be used only inside add_impurity()
@@ -299,11 +324,11 @@ def add_impurity(it_new, impurity_type = None, addtype = 'central', calc = [], r
         if v == 1: #TEST
             
             natoms_v1 = len(added.init.xcart) # for test 
-            st_rep_after  = replic( added.init,      (1,2,1) )
+            st_rep_after  = added.init.replic( (1,2,1) )
 
             rep = copy.deepcopy(init)
 
-            rep.init = replic( rep.init, (1,2,1) );   
+            rep.init = rep.init.replic( (1,2,1) );   
             #print rep
             rep = add(znucl, "", rep, write_geo = False)
             #print rep
@@ -320,11 +345,11 @@ def add_impurity(it_new, impurity_type = None, addtype = 'central', calc = [], r
                 #print a, b, c
                 #np.concatenate(a, b, c):
                 if not a:
-                    print "Can't find ", np.around(x,3), "in replic  "
+                    print_and_log( "Error! Can't find ", np.around(x,3), "in replic  ")
                     raise RuntimeError
 
             #assert all([ all( np.around(v1, 8) == np.around(v2, 8) ) for (v1, v2) in zip(st_rep_after.xcart, rep.init.xcart) ])
-            print "add_impurity: test succesfully done"
+            print_and_log( "add_impurity: test succesfully done")
 
         if natoms_v1 != len(added.init.xcart): print_and_log("You have different number of pores in different versions\n");  raise RuntimeError
         return
@@ -335,105 +360,124 @@ def add_impurity(it_new, impurity_type = None, addtype = 'central', calc = [], r
         "if put_exactly_to is True, then atom just added and nothing are searched"
 
 
-        if write_geo and os.path.exists(new.path["input_geo"]):
-            print_and_log("add: File '"+new.path["input_geo"]+"' already exists; continue\n");
+        if write_geo and os.path.exists(new.path["input_geo"]) and not override:
+            print_and_log("add: File '"+new.path["input_geo"]+"' already exists; continue\n", imp = 'Y');
             return new
 
         #new.init = return_atoms_to_cell(new.init)
+        if replace_atom:
+            #atom substitution
+            if znucl not in new.init.znucl:
+                new.init.znucl.append(znucl)
+                new.init.ntypat+=1
+                new.init.typat[replace_atom] = new.init.ntypat
+            else:
+                ind = new.init.znucl.index(znucl)
+                new.init.typat[replace_atom] = ind + 1
+            new.init.nznucl = []
+            for typ in range(1, new.init.ntypat+1):
+                new.init.nznucl.append(new.init.typat.count(typ) )
 
-        new_before = copy.deepcopy(new)
-        
-        # new.init.xcart[-2][0]-=0.9 #was made once manually for c1gCOi10.1
-        # new.init.xcart[-2][2]+=0.2
-        # new.init.xred = xcart2xred(new.init.xcart, new.init.rprimd)
-        write_xyz(new.init)
-        #step = 0.042
-        step = 0.06
-        #r_pore = 0.56
-        #fine = 0.3 # for visualisation of pores
-        #fine = 4   #controls small steps; the steps are smaller for larger numbers
-        #r_pore = 0.54
-        prec = 0.004 # precision of center Angs
-        if new.hex_a == None:
-            r_mat = 1.48 -step
+
+
         else:
-            r_mat = new.hex_a / 2 - step
+            new_before = copy.deepcopy(new)
+            
+            # new.init.xcart[-2][0]-=0.9 #was made once manually for c1gCOi10.1
+            # new.init.xcart[-2][2]+=0.2
+            # new.init.xred = xcart2xred(new.init.xcart, new.init.rprimd)
+            write_xyz(new.init)
+            #step = 0.042
+            step = 0.06
+            #r_pore = 0.56
+            #fine = 0.3 # for visualisation of pores
+            #fine = 4   #controls small steps; the steps are smaller for larger numbers
+            #r_pore = 0.54
+            prec = 0.004 # precision of center Angs
+            if new.hex_a == None:
+                r_mat = 1.48 -step
+            else:
+                r_mat = new.hex_a / 2 - step
 
-        if put_exactly_to:
-            pores_xred = [np.array(put_exactly_to),]
-            print 'Inmpurity just put in ', pores_xred
-        else:
-            pores = find_pores(new.init, r_mat, r_pore, step, fine, prec,  addtype, new.gbpos, find_close_to, check_pore_vol) #octahedral
-            pores_xred = pores.xred
-        
-
-
-        npores = len(pores_xred)
-        
-        st = new.init
-
-        #delete last oxygen; was made once manually for c1gCOi10.1
-        # st.natom-=1
-        # del st.xred[-1]
-        # del st.typat[-1]
-
-
-
-
-        st.natom += npores
-        st.xred.extend( pores_xred )
-
-        if znucl in st.znucl:
-            print "znucl of added impurity is already in cell"
-            ind = st.znucl.index(znucl)
-            typat = ind+1
-            st.nznucl[ind]+=npores
-        else:
-            st.ntypat +=1
-            typat = st.ntypat
-            st.znucl.append( znucl )
-            st.nznucl.append( npores )
+            if put_exactly_to:
+                pores_xred = [np.array(put_exactly_to),]
+                print_and_log( 'Inmpurity just put in ', pores_xred, imp = 'Y')
+            else:
+                pores = find_pores(new.init, r_mat, r_pore, step, fine, prec,  addtype, new.gbpos, find_close_to, check_pore_vol) #octahedral
+                pores_xred = pores.xred
+            
 
 
+            npores = len(pores_xred)
+            
+            st = new.init
 
-        for i in range( npores  ):
-            st.typat.append( typat )
+            #delete last oxygen; was made once manually for c1gCOi10.1
+            # st.natom-=1
+            # del st.xred[-1]
+            # del st.typat[-1]
 
 
 
-        st.xcart = xred2xcart(st.xred, st.rprimd)
 
-        new.init = st
+            st.natom += npores
+            st.xred.extend( pores_xred )
 
-        #print "Add impurity: len(xred ", len(new.init.xred)
-        #print "natom", new.init.natom
+            if znucl in st.znucl:
+                print_and_log( "znucl of added impurity is already in cell")
+                ind = st.znucl.index(znucl)
+                typat = ind+1
+                st.nznucl[ind]+=npores
+            else:
+                st.ntypat +=1
+                typat = st.ntypat
+                st.znucl.append( znucl )
+                st.nznucl.append( npores )
 
 
-        #For automatisation of fit
-        try: 
-            #new.build
-            if new.build.nadded == None:      new.build.nadded=npores
-            else: new.build.nadded+=npores
-            if new.build.listadded == [None]: new.build.listadded = range(new.natom - npores, new.natom) #list of atoms which were added
-            else: new.build.listadded.extend( range(new.natom - npores, new.natom) )
-            #print "Warning!!! Information about added impurities rewritten"
-        except AttributeError: 
-            pass
 
-        #new.init.znucl = new.znucl
-        #new.init.typat = new.typat
-        
-        #write_xyz(replic(new.init, (2,1,2))  , xyzpath)
+            for i in range( npores  ):
+                st.typat.append( typat )
 
-        #test_adding_of_impurities(new, new_before, v)
 
-        print_and_log("Impurity with Z="+str(znucl)+" has been added to the found pore in "+new.name+"\n\n")
-        
+
+            st.xred2xcart()
+
+            new.init = st
+
+            #print "Add impurity: len(xred ", len(new.init.xred)
+            #print "natom", new.init.natom
+
+
+            #For automatisation of fit
+            try: 
+                #new.build
+                if new.build.nadded == None:      new.build.nadded=npores
+                else: new.build.nadded+=npores
+                if new.build.listadded == [None]: new.build.listadded = range(new.natom - npores, new.natom) #list of atoms which were added
+                else: new.build.listadded.extend( range(new.natom - npores, new.natom) )
+                #print "Warning!!! Information about added impurities rewritten"
+            except AttributeError: 
+                pass
+
+            #new.init.znucl = new.znucl
+            #new.init.typat = new.typat
+            
+            #write_xyz(replic(new.init, (2,1,2))  , xyzpath)
+
+            #test_adding_of_impurities(new, new_before, v)
+
+            print_and_log("Impurity with Z="+str(znucl)+" has been added to the found pore in "+new.name+"\n\n")
+            
+
+
+
+
         if write_geo:
             write_xyz(new.init , xyzpath)
-            new.write_geometry("init",new.des)
+            new.write_geometry("init",new.des, override = override)
 
-        print "\n"
+        print_and_log( "\n")
 
 
         return new
@@ -475,18 +519,7 @@ def add_impurity(it_new, impurity_type = None, addtype = 'central', calc = [], r
             new = copy.deepcopy(calc[id])
 
             new.init = new.end #replace init structure by the end structure
-            #new.xred = new.init.xred
-            #new.xcart = new.init.xcart
-            #new.rprimd = new.init.rprimd
-            #del new.init.xred[-1]
-            #del new.init.xcart[-1]
-            #del new.init.typat[-1]
-            #new.init.natom -=1
-            #print new.init.xred
 
-            #print new.end.xred
-            #print new.xred
-            #rint new.init.xred
             new.version = v+add_to_version
             new.name = it_new#+'.'+id[1]+'.'+str(id[2])
             new.des = 'Obtained from '+str(id)+' by adding '+impurity_type+' impurity '
@@ -508,7 +541,7 @@ def add_impurity(it_new, impurity_type = None, addtype = 'central', calc = [], r
         """2. The case of insertion to geo files------------------------------------------------------------"""
     else:     
 
-        
+        """ Please rewrite using new functions """
 
         print_and_log("You does not set 'id' of relaxed calculation. I try to find geometry files in "+it_new+" folder\n")
 
@@ -532,7 +565,7 @@ def add_impurity(it_new, impurity_type = None, addtype = 'central', calc = [], r
         #geofilelist = runBash('find '+geo_path+' -name "*grainA*.geo*" ').splitlines()
         #geofilelist = runBash('find '+geo_path+' -name "*.geo*" ').splitlines()
         geofilelist = glob.glob(geo_path+'/*.geo*')
-        print "There are several files here already: ", geofilelist
+        print_and_log( "There are several files here already: ", geofilelist, imp = 'y' )
         #print 'find '+geo_path+' -name "*.geo*" ',geofilelist
         #return
 
@@ -555,7 +588,7 @@ def add_impurity(it_new, impurity_type = None, addtype = 'central', calc = [], r
             igl = input_geofile.split("/")
             #new.name = igl[-3]+'/'+igl[-3] #+input_geofile
             new.name = struct_des[it_new].sfolder+"/"+it_new+"/"+it_new
-            print "New path and part of name of file is ", new.name
+            print_and_log( "New path and part of name of file is ", new.name, imp = 'Y')
             #return
             new.des = 'Obtained from '+input_geofile+' by adding '+impurity_type+' impurity '
             #new.init.xred   = new.xred
@@ -599,7 +632,7 @@ def insert_cluster(insertion, i_center, matrix, m_center):
 
 
 
-    hproj = [ (r[0][i]+r[1][i]+r[2][i]) * 0.5 for i in 0,1,2 ] #projection of vectors on three axis
+    hproj = [ (r[0][i]+r[1][i]+r[2][i]) * 0.5 for i in (0,1,2) ] #projection of vectors on three axis
 
     for i, x in enumerate(ins.xcart):
         ins.xcart[i] = x - i_center
@@ -610,7 +643,7 @@ def insert_cluster(insertion, i_center, matrix, m_center):
     max_dis = 1
     for i_x, ix in enumerate(ins.xcart):
         dv_min = max_dis
-        print "Insertion atom ",ix,
+        print_and_log( "Insertion atom ",ix,)
         
         for j, mx in enumerate(mat.xcart):
             dv = mx - ix
@@ -619,7 +652,9 @@ def insert_cluster(insertion, i_center, matrix, m_center):
                 if dv[i] < -hproj[i]: dv = dv + mat.rprimd[i]
             
             len1 = np.linalg.norm(dv)
-            len2, second_len2 = image_distance(mx, ix, r, 2) #check len1
+            len2, second_len2 = mat.image_distance(mx, ix, r, 2) #check len1
+            
+
             #print "Lengths calculated with two methods ", len1, len2
             len1 = len2 #just use second method
             #assert np.around(len1,1) == np.around(len2,1)
@@ -631,17 +666,17 @@ def insert_cluster(insertion, i_center, matrix, m_center):
 
 
         if dv_min == max_dis:
-            print " is more far away from any matrix atom than ",dv_min," A; I insert it"
+            print_and_log( " is more far away from any matrix atom than ",dv_min," A; I insert it")
             mat.xcart.append( ix )
-            print 'type of added atom is ', ins.typat[i_x]
+            print_and_log( 'type of added atom is ', ins.typat[i_x])
             mat.typat.append( ins.typat[i_x]   )
         else:        
-            print "will replace martix atom", mat.xcart[j_r] 
+            print_and_log( "will replace martix atom", mat.xcart[j_r] )
             mat.xcart[j_r] = ix.copy()
     
 
-
-    mat.xred = xcart2xred(mat.xcart, r)
+    mat.rprimd = r
+    mat.xcart2xred()
     mat.natom = len(mat.xcart)
     mat.name = 'test_of_insert'
     write_xyz(mat)
@@ -665,7 +700,7 @@ def insert(it_ins, ise_ins, mat_path, it_new, calc, type_of_insertion = "xcart" 
         raise RuntimeError
 
     if it_ins not in mat_path and it_ins not in it_new: 
-        print it_ins, mat_path, it_new
+        print_and_log('Cells are', it_ins, mat_path, it_new)
         print_and_log("Error! you are trying to insert coordinates from cell with different name\n\n")
         #raise RuntimeError       
 
@@ -693,7 +728,7 @@ def insert(it_ins, ise_ins, mat_path, it_new, calc, type_of_insertion = "xcart" 
             ins_working = ins
             ins = calc[(it_ins, ise_ins, mat.version)]
         except KeyError: 
-            print "No key", (it_ins, ise_ins, mat.version), "I use previous working version !!!"
+            print_and_log( "No key", (it_ins, ise_ins, mat.version), "I use previous working version !!!", imp = 'y' )
             ins = ins_working
             #return
         #ins.end.znucl = ins.znucl
@@ -732,7 +767,7 @@ def insert(it_ins, ise_ins, mat_path, it_new, calc, type_of_insertion = "xcart" 
             mat.init = copy.deepcopy(ins.end)
             #mat.build = build
             mat.init.rprimd = rprimd #return initial rprimd
-            mat.init.xcart = xred2xcart(mat.init.xred, mat.init.rprimd) #calculate xcart with new rprimd
+            mat.init.xred2xcart() #calculate xcart with new rprimd
           
             des = "atoms with reduced coord. from "+ins.name+" was fully copied to "+mat_geofile
             mat.init.name = 'test_insert_xred'+str(mat.version)
@@ -745,3 +780,93 @@ def insert(it_ins, ise_ins, mat_path, it_new, calc, type_of_insertion = "xcart" 
 
     return
     
+
+
+
+
+
+def determine_voids(st, r_impurity, fine = 1, step_dec = 0.05):
+
+    if not r_impurity:
+        printlog('add_neb(): Error!, Please provide *r_impurity* (1.6 A?)')
+
+
+    sums = []
+    avds = []
+    printlog('Searching for voids', important = 'y')
+    st_pores = find_pores(st, r_matrix = 0.5, r_impurity = r_impurity, step_dec = step_dec, fine = fine, calctype = 'all_pores')
+
+    printlog('List of found voids:\n', np.array(st_pores.xcart) )
+    write_xyz(st.add_atoms(st_pores.xcart, 'H'), file_name = st.name+'_possible_positions')
+    write_xyz(st.add_atoms(st_pores.xcart, 'H'), replications = (2,2,2), file_name = st.name+'_possible_positions_replicated')
+
+    for x in st_pores.xcart:
+        # summ = local_surrounding(x, st, n_neighbours = 6, control = 'sum', periodic  = True)
+        # avd = local_surrounding(x, st, n_neighbours = 6, control = 'av_dev', periodic  = True)
+        summ, avd = local_surrounding2(x, st, n_neighbours = 6, control = 'sum_av_dev', periodic  = True)
+        # print (summ, avd)
+        
+        sums.append(summ)
+        avds.append(avd[0])
+    # print
+    sums = np.array(sums)
+    avds  = np.array(avds).round(0)
+
+    print_and_log('Sum of distances to 6 neighboring atoms for each void (A):\n', sums, imp ='y')
+    print_and_log('Distortion of voids (0 - is symmetrical):\n', avds, imp ='y')
+    
+    return st_pores, sums, avds
+
+def determine_unique_voids(st_pores, sums, avds):
+    crude_prec = 1
+    sums_crude = np.unique(sums.round(crude_prec))
+    print_and_log('The unique voids based on the sums:', 
+        '\nwith 0.01 A prec:',np.unique(sums.round(2)),
+        '\nwith 0.1  A prec:',sums_crude,
+        imp ='y')
+    print_and_log('Based on crude criteria only', len(sums_crude),'types of void are relevant', imp = 'y') 
+
+
+    insert_positions = []
+    start_table = []
+    for i, s in enumerate(sums_crude):
+        index_of_first =  np.where(sums.round(crude_prec)==s)[0][0]
+
+        start_table.append([i,  st_pores.xcart[index_of_first].round(2), index_of_first,
+        avds[index_of_first], sums[index_of_first]     ])
+
+        insert_positions.append( st_pores.xcart[index_of_first] )
+
+    print_and_log( tabulate(start_table, headers = ['void #', 'Cart.', 'Index', 'Dev.', 'Sum'], tablefmt='psql'), imp = 'Y' )
+    
+    return insert_positions
+
+def insert_atom(st, el, i_void = None, r_imp = 1.6, ):
+    """Simple Wrapper for inserting atoms """
+
+
+    r_impurity = r_imp
+    st_pores, sums, avds = determine_voids(st, r_impurity)
+
+    insert_positions = determine_unique_voids(st_pores, sums, avds)
+
+    printlog('To continue please choose *i_void* from the list above', imp = 'y')
+    if i_void == None:
+        sys.exit()
+
+    # st.name = st.name.split('+')[0]
+
+
+    xc = insert_positions[i_void]
+    
+    st_new, i_add = st.add_atoms([xc], el, return_ins = True)
+
+    st_new.name+='+'+el+str(i_void)
+    st_new.des+=';Atom '+el+' added to '+ str(xc)
+    printlog(st.des, imp = 'y')
+
+    st_new.write_xyz()
+    st_new.magmom = [None]
+
+    return st_new, i_add
+

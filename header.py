@@ -1,666 +1,305 @@
 # -*- coding: utf-8 -*-
-import os, subprocess
-import math
-import numpy as np
-import copy
-import datetime
-import shutil
-import traceback
-import glob
-from operator import itemgetter
-import sys
+#Copyright Aksyonov D.A
+#hello_man
+from __future__ import division, unicode_literals, absolute_import, print_function
 
-sys.path.append('../../Simulation_wrapper/')
+"""
+Siman - management of VASP calculations
+Author: Aksyonov D.A.
 
-#Global names
-#corenum = 8; queue = ' ' # Number of cores
-cluster_address = 's'
-corenum = 24; queue = ' -l cmmd '
-close_run = False # alows to control close run file automatically after each add_loop
-calc = {}
-conv = {}
-varset = {}
-struct_des = {};
+
+!Internal units are Angstroms!
+Bohrs should be converted during reading!
+
+TODO:
+
+
+"""
+
+import os, subprocess, sys, shelve
+try:
+    import matplotlib as mpl
+
+
+
+    """Global matplotlib control"""
+    # size = 22 #for one coloumn figures
+    size = 16 #for DOS
+    # size = 16 #for two coloumn figures
+    mpl.rc('font',family='Serif')
+    # mpl.rc('xtick', labelsize= size) 
+    # mpl.rc('ytick', labelsize= size) 
+    # mpl.rc('axes', labelsize = size) 
+    # mpl.rc('legend', fontsize= size) 
+    # mpl.rc('Axes.annotate', fontsize= size) #does not work
+    mpl.rcParams.update({'font.size': size})
+    mpl.rcParams.update({'mathtext.fontset': "stix"})
+    # plt.rcParams['mathtext.fontset'] = "stix"
+
+    #paths to libraries needed by siman
+    # sys.path.append('/home/dim/Simulation_wrapper/ase') #
+    # plt = None
+except:
+    mpl = None
+    plt = None
+    print('Warning! matplotlib is not installed! Some functions will not work!')
+
 history = []
-gb4_geo_folder = '/home/dim/Simulation_wrapper/gb4/out/'
-project_path_cluster = "~/"
-geo_folder = 'geo/'
-# path_to_images = 'images/'
-path_to_images = '/home/dim/gdrive/Наука/paper5/fig/'
 
-path_to_jmol = '/home/dim/installed/jmol-14.2.12_2015.02.11/jmol.sh '
+#Defaults to some project_conf values
+PBS_PROCS = False # if true than #PBS -l procs="+str(number_cores) is used
+WALLTIME_LIMIT = False # now only for PBS if True 72 hours limit is used
 
-log = open('log','a')
-#history = open('log','a')
+
+try:
+    from project_conf import *
+    import project_conf
+    siman_run = True
+    log = open('log','a')
+    warnings = 'neyY'
+    warnings = 'Y'
+
+
+except:
+    # print('Some module is used separately; default_project_conf.py is used')
+    mpl.use('agg') #switch matplotlib on or off; for running script using ssh
+    siman_run = False
+    from default_project_conf import *
+    history.append('separate run')
+    warnings = 'yY'
+
+try:
+    import matplotlib.pyplot as plt
+except:
+    plt = None
+
+calc_database = 'only_calc.gdbm3'
+
+class CalcDict(dict):
+    def __getitem__(self, key):
+        # print(self)
+        if type(key) == str:
+            # print('String key detected', key)
+            key_str = key
+            l = key.split('.')
+            if len(l) > 2:
+                key = ('.'.join(l[0:-2]), l[-2], int(l[-1]))            
+        # else:
+
+        if dict.__contains__(self, key):
+            # print('key', key, 'is  in self')
+            val = dict.__getitem__(self, key)
+        
+        else:
+            with shelve.open(calc_database, protocol = 3) as d:
+                try:
+                    val = d[str(key)]
+                    dict.__setitem__(self, key, val)
+                    # print('reading ',str(key), 'from db')
+                except:
+                    val = None
+        
+
+        return val
+
+    def __contains__(self, key):
+
+        if dict.__contains__(self, key):
+            return True
+        
+        else:
+            with shelve.open(calc_database, protocol = 3) as d:
+                # print('checking if key',key, 'is in db:', str(key) in d)
+                # print(self)
+                return str(key) in d
+
+    def items(self):
+
+        keys = []
+
+        with shelve.open(calc_database, protocol = 3) as d:
+            for key in d:
+                key = key.replace("'", "").replace('(', '').replace(')', '') #remove unnessary symbols from string
+                l = key.split(',') # go back to tuple
+
+                if len(l) == 3 and l[2].strip().isdigit():
+                    keyt = (l[0].strip(), l[1].strip(), int(l[2]))
+                    keys.append(keyt)
+
+            return keys
+
+
+#Global variables
+final_vasp_clean     = True 
+copy_to_cluster_flag = True
+close_run = False # alows to control close run file automatically after each add_loop
+first_run = True  # needed to write header of run script
+ssh_object = None # paramiko ssh_object
+sshpass = None # using sshpass wrapper for rsync; see functions.py/push_to_server()
+show = None
+corenum = 1
+check_job = 1 # check job by additional ssh requests
+
+
+
+
+calc = CalcDict()
+# global db
+db = calc
+conv = {};
+varset = {};
+struct_des = {};
+
+sets = varset
+
+
+
+
+
+
 #Constants
 to_ang = 0.52917721092
 to_eV = 27.21138386
 Ha_Bohr_to_eV_A = 51.4220641868956
 kB_to_GPa = 0.1
 eV_A_to_J_m = 16.021765
+THz2eV = 0.00413566553853599
+kJ_mol2eV = 1.0364e-2
+J2eV = 6.242e+18
 
-def print_and_log(mystring):
-    print mystring,
-    log.write(mystring)
+kB = 8.617e-5 # eV/K
+TRANSITION_ELEMENTS = [22, 23, 25, 26, 27, 28]
+ALKALI_ION_ELEMENTS = [3, 11, 19, 37]
+MAGNETIC_ELEMENTS = [26, 27, 28]
+# EXCLUDE_NODES = False
+el_dict = {'octa':200, 'n':0, 'H':1, 'He':2, 'Li':3, 'Be':4, 'B':5, 'C':6, 'N':7, 'O':8, 'F':9, 'Ne':10, 'Na':11, 'Mg':12, 'Al':13, 'Si':14, 'P':15, 'S':16, 'Cl':17, 'Ar':18, 'K':19, 'Ca':20, 'Sc':21, 'Ti':22, 'V':23, 'Cr':24, 'Mn':25, 'Fe':26, 'Co':27, 'Ni':28, 'Cu':29, 'Zn':30, 'Ga':31, 'Ge':32, 'As':33, 'Se':34, 'Br':35, 'Kr':36, 'Rb':37, 'Sr':38, 'Y':39, 'Zr':40, 'Nb':41, 'Mo':42, 'Tc':43, 'Ru':44, 'Rh':45, 'Pd':46, 'Ag':47, 'Cd':48, 'In':49, 'Sn':50, 'Sb':51, 'Te':52, 'I':53, 'Xe':54, 'Cs':55, 'Ba':56, 'La':57, 'Ce':58, 'Pr':59, 'Nd':60, 'Pm':61, 'Sm':62, 'Eu':63, 'Gd':64, 'Tb':65, 'Dy':66, 'Ho':67, 'Er':68, 'Tm':69, 'Yb':70, 'Lu':71, 'Hf':72, 'Ta':73, 'W':74, 'Re':75, 'Os':76, 'Ir':77, 'Pt':78, 'Au':79, 'Hg':80, 'Tl':81, 'Pb':82, 'Bi':83, 'Po':84, 'At':85, 'Rn':86, 'Fr':87, 'Ra':88, 'Ac':89, 'Th':90, 'Pa':91, 'U':92, 'Np':93, 'Pu':94, 'Am':95, 'Cm':96, 'Bk':97, 'Cf':98, 'Es':99, 'Fm':100, 'Md':101, 'No':102, 'Lr':103, 'Rf':104, 'Db':105, 'Sg':106, 'Bh':107, 'Hs':108, 'Mt':109, 'Ds':110, 'Rg':111, 'Cn':112, 'Uuq':114, 'Uuh':116, }
+nu_dict = { 200:'octa', 0:'n', 1:'H', 2:'He', 3:'Li', 4:'Be', 5:'B', 6:'C', 7:'N', 8:'O', 9:'F', 10:'Ne', 11:'Na', 12:'Mg', 13:'Al', 14:'Si', 15:'P', 16:'S', 17:'Cl', 18:'Ar', 19:'K', 20:'Ca', 21:'Sc', 22:'Ti', 23:'V', 24:'Cr', 25:'Mn', 26:'Fe', 27:'Co', 28:'Ni', 29:'Cu', 30:'Zn', 31:'Ga', 32:'Ge', 33:'As', 34:'Se', 35:'Br', 36:'Kr', 37:'Rb', 38:'Sr', 39:'Y', 40:'Zr', 41:'Nb', 42:'Mo', 43:'Tc', 44:'Ru', 45:'Rh', 46:'Pd', 47:'Ag', 48:'Cd', 49:'In', 50:'Sn', 51:'Sb', 52:'Te', 53:'I', 54:'Xe', 55:'Cs', 56:'Ba', 57:'La', 58:'Ce', 59:'Pr', 60:'Nd', 61:'Pm', 62:'Sm', 63:'Eu', 64:'Gd', 65:'Tb', 66:'Dy', 67:'Ho', 68:'Er', 69:'Tm', 70:'Yb', 71:'Lu', 72:'Hf', 73:'Ta', 74:'W', 75:'Re', 76:'Os', 77:'Ir', 78:'Pt', 79:'Au', 80:'Hg', 81:'Tl', 82:'Pb', 83:'Bi', 84:'Po', 85:'At', 86:'Rn', 87:'Fr', 88:'Ra', 89:'Ac', 90:'Th', 91:'Pa', 92:'U', 93:'Np', 94:'Pu', 95:'Am', 96:'Cm', 97:'Bk', 98:'Cf', 99:'Es', 100:'Fm', 101:'Md', 102:'No', 103:'Lr', 104:'Rf', 105:'Db', 106:'Sg', 107:'Bh', 108:'Hs', 109:'Mt', 110:'Ds', 111:'Rg', 112:'Cn', 114:'Uuq', 116:'Uuh', }
 
-def runBash(cmd):
-    """Input - string; Executes Bash commands and returns stdout
-Need: import subprocess
+
+def print_and_log(*logstrings, **argdic):
     """
-    p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE)
-    out = p.stdout.read().strip()
-    # print out
-    return out  #This is the stdout from the shell command
-
-class des():
-    def __init__(self, sectionfolder = "forgot_folder", description = "forgot_description"):
-        self.des = description
-        self.sfolder = sectionfolder
-
-class empty_struct():
-    def __init__(self):
-        pass
-
-def update_des():
+    '' - silent
+    e - errors and warnings
+    a - attentions
+    m - minimalistic output of scientific procedures - only obligatory mess are shown
+    M - maximalistic output of scientific procedures  
+    debug_level importance:
+        'n' - not important at all - for debugging
+        ''  - almost all actions, no flag is needed
+        'y' - important - major actions
+        'Y' - super important, or output asked by user
     """
-    Naming conventions:
-
-    endings:
-    '_ml' - was used to show that this calculation uses manual equilibrium lattice determination and 
-    contains several versions of identical structures with different
-    lattice constants. Now not in use, because I always use this method. Usually 16 versions for hcp;
-
-    '_r' - calculation with structure constructed for fitted lattice constants; 
-    Now was replaced with '.f'; Usually one version.
-    '.ur' - unrelaxed
-    '.f'  - fitted
-    '.fr' - means that current calculation based on the structure for which lattice constants were fitted and
-    positions of atoms were relaxed. However see description to know for wich set they were fitted and relaxed.
-    Calculations with '.f' and '.fr' can have different versions which are correspondig to different sets.
+    end = '\n\n'# no argument for end, make one separate line
     
-    .m - only matrix, all impurities were removed and matrix was freezed
+    debug_level  = 'e' #empty
+    for key in argdic:
+        if 'imp' in key:
+            debug_level = argdic[key]
+        
+        if 'end' in key:
+            end = argdic[key]
 
 
-    letters in name, wich are usually between didgits and element's names:
-    b - stands for bulk, which denote ideal cells without boundaries.
-    g - cells with grain boundary;
-    v - means that impurity is in the volume of grain; far away from boundaries;
-    i - means that impurity is close to interface plane (grain boundary)
+    mystring = ''
+    for m in logstrings:
+        mystring+=str(m)+' '
 
-    Versions:
-    20 - usually means that lattice constatns was used from other calculation and this is very good assumtion.
 
+    if len(mystring.splitlines()) == 1:
+        mystring = '-- '+mystring
+    else:
+        ''
+        # mystring = '    '+mystring.replace('\n', '\n    ') 
     
+    mystring+=end
 
-    """
 
-    #1.Description of structures
-    struct_des['bcc']       = des("test",   "test cells for testing total drift v1 - ideal and v2 with atom shift")
-    struct_des['gr221']       = des("GR",   "graphite 16 atoms Baskin1955")
-    struct_des['O']       = des("box",   "O in box")
-    struct_des['OO']       = des("box",   "O-O dimer in box; with initial velocity for constant change of length")
-    struct_des['TiC']       = des("Ti-C",   "TiC(225)")
-    struct_des['Ti2C227']       = des("Ti-C",   "Ti2C(227)")
-    struct_des['Ti2O227']       = des("Ti-O",   "Ti2O(227)")
+    if 'Error' in mystring:# or 'Warning' in mystring:
+        mystring+='\n\n\n'
     
-    struct_des['Ti2C164']       = des("Ti-C",   "Ti2C(164)")
-    struct_des['Ti2O164']       = des("Ti-O",   "Ti2O(164)")
+    if 'Warning' in mystring or 'Attention' in mystring:
+        debug_level = 'Y'
 
+    for level in 'neyY':
+        # print(level, debug_level)
+        if (level in warnings and level in debug_level):
+            print (mystring,  end = "")
 
+    # if warnings:
+    #     ''
+    #     # print(debug_level)
+    #     if 'n' in debug_level and 'n' not in warnings:
+    #         pass
+    #     else:
+    #         print (mystring,  end = "")
 
-    #C1 twin
-    struct_des['c1b']       = des("bulk",   "Bulk cell without boundary correspondig to cell with C1 twin")
-    struct_des['c1b_ml']    = des("bulk",  "The same as c1b, but with 16 versions"   )
-    struct_des['c1bC']      = des("C1/C",  " c1b_ml with carbon v1-16"   )
-    struct_des['c1bC.f']      = des("C1/C",  " fitted v1"   )
-
-    struct_des['c1bO_template'] = des("C1/O",  " template without oxygen; lattice constants from t111bO.f"   )
-    struct_des['c1bO'] = des("C1/O",  "v1-16 from c1bC; from template with added oxygen v20 "   )
-    struct_des['c1bO.f']      = des("C1/O",  " fitted v1"   )
-
+    if siman_run:
+        log.write(mystring)
     
-    struct_des['c1gCv']    = des("C1/C",  " carbon in grain volume; v1-v5 the same -0.3 0.5"   )
-    struct_des['c1gCi1']   = des("C1/C",  " carbon in place 1; v1-v5 the same as -0.3 0.5"   )
-
-    struct_des['c1gBv']    = des("C1/B",  " boron in grain volume; v1-v5 the same -0.3 0.5"   )
-    struct_des['c1gBi1']   = des("C1/B",  " boron in place 1; v1-v5 the same as -0.3 0.5"   )
-
-
-    struct_des['c1gO_template'] = des("C1/O",  " template without oxygen; lattice constants from t111bO.f"   )
-    struct_des['c1gOv']     = des("C1/O",  "oxygen in grain volume; v1-v5  "   )
-    struct_des['c1gOi1']    = des("C1/O",  " oxygen in place 1; v1-v5 "   )
-
-
-
-
-    struct_des['c1b_r']     = des("C1",   "The same as c1b, but with fitted lattice constants acell 2.9380 2.9380 4.6445 #angstrom #obtained using fit_hex(0.0002,0.0003,400,700, 'c1b_ml', '830', range(1,17), calc)")
-    struct_des['c1g']       = des("C1", "Cell with C1 twin with the same lateral sizes as c1b_r and 10 different specific volumes")
-    struct_des['c1g112']       = des("C1", "Cell with C1 twin with the same lattice const as c1b_r and 5 different specific volumes")
-    struct_des['c1g121']       = des("C1", "Cell with C1 twin with the same lattice const as c1b_r and 5 different specific volumes")
-
-    struct_des['c1gCO_template'] = des('C1/CO', 'template without impurities; lattice constants from t111gCO_template'   )
-    struct_des['c1gCO_template_grainvol'] = des('C1/CO', 'template for generation of grain volume impurity cases'   )
-    struct_des['c1gCO_template_coseg'] = des('C1/CO', 'template for generation of coseg cases'   )
-    struct_des['c1gCO_template_segreg'] = des('C1/CO', 'template for generation of segreg cases'   )
-
-    struct_des['c1gCOv1'] = des('C1/CO/c1g_gvol', 'corresponding configurations with impurities in volume; made from c1gCv.93kp7'   )
-    struct_des['c1gCOv2'] = des('C1/CO/c1g_gvol', 'corresponding configurations with impurities in volume; made from c1gCv.93kp7'   )
-    struct_des['c1gCOv3'] = des('C1/CO/c1g_gvol', 'corresponding configurations with impurities in volume; made from c1gCv.93kp7'   )
-    struct_des['c1gCOv4'] = des('C1/CO/c1g_gvol', 'corresponding configurations with impurities in volume; made from c1gCv.93kp7'   )
-    struct_des['c1gCOv5'] = des('C1/CO/c1g_gvol', 'corresponding configurations with impurities in volume; made from c1gCv.93kp7'   )
-    struct_des['c1gCOv6'] = des('C1/CO/c1g_gvol', 'corresponding configurations with impurities in volume; made from c1gCv.93kp7'   )
-    struct_des['c1gCOv7'] = des('C1/CO/c1g_gvol', 'corresponding configurations with impurities in volume; made from c1gCv.93kp7'   )
-    struct_des['c1gCvOvms'] = des('C1/CO/c1g_gvol', 'corresponding configurations with impurities in volume; made from c1gCv.93kp7'   )
-
-    struct_des['c1gCOi1.2-1'] = des('C1/CO/c1g_coseg', 'co-segregation configurations; made from c1g.929'   )
-    struct_des['c1gCOi2.2-1'] = des('C1/CO/c1g_coseg', 'co-segregation configurations; made from c1g.929'   )
-    struct_des['c1gCOi3.1-2'] = des('C1/CO/c1g_coseg', 'co-segregation configurations; made from c1g.929'   )
-    struct_des['c1gCOi4.2-1'] = des('C1/CO/c1g_coseg', 'co-segregation configurations; made from c1g.929'   )
-    struct_des['c1gCOi5.2-1'] = des('C1/CO/c1g_coseg', 'co-segregation configurations; made from c1g.929'   )
-    struct_des['c1gCOi6.1-2'] = des('C1/CO/c1g_coseg', 'co-segregation configurations; made from c1g.929'   )
-    struct_des['c1gCOi7.1-1'] = des('C1/CO/c1g_coseg', 'co-segregation configurations; made from c1g.929'   )
-    struct_des['c1gCOi8.2-2'] = des('C1/CO/c1g_coseg', 'co-segregation configurations; made from c1g.929'   )
-    struct_des['c1gOCi1.2-1'] = des('C1/CO/c1g_coseg', 'co-segregation configurations; made from c1g.929'   )
-    struct_des['c1gOCi2.2-1'] = des('C1/CO/c1g_coseg', 'co-segregation configurations; made from c1g.929'   )
-    struct_des['c1gOCi3.1-2'] = des('C1/CO/c1g_coseg', 'co-segregation configurations; made from c1g.929'   )
-    struct_des['c1gOCi4.2-1'] = des('C1/CO/c1g_coseg', 'co-segregation configurations; made from c1g.929'   )
-    struct_des['c1gOCi5.2-1'] = des('C1/CO/c1g_coseg', 'co-segregation configurations; made from c1g.929'   )
-    struct_des['c1gOCi6.1-2'] = des('C1/CO/c1g_coseg', 'co-segregation configurations; made from c1g.929'   )
-    struct_des['c1gOCi7.1-1'] = des('C1/CO/c1g_coseg', 'co-segregation configurations; made from c1g.929'   )
-    struct_des['c1gOCi8.2-2'] = des('C1/CO/c1g_coseg', 'co-segregation configurations; made from c1g.929'   )
-    struct_des['c1gCOi10.1' ] = des('C1/CO/c1g_coseg',  'C and O in one pore; made from c1gCi1Ov O was removed'   )
-
-
-    struct_des['c1gCi1Ov'] = des('C1/CO/c1g_segreg', 'corresponding segregation configurations; made also from c1g.929'   )
-    struct_des['c1gCi2Ov'] = des('C1/CO/c1g_segreg', 'corresponding segregation configurations; made also from c1g.929'   )
-    struct_des['c1gOi1Cv'] = des('C1/CO/c1g_segreg', 'corresponding segregation configurations; made also from c1g.929'   )
-    struct_des['c1gOi2Cv'] = des('C1/CO/c1g_segreg', 'corresponding segregation configurations; made also from c1g.929'   )
-    #T1 twin
-    struct_des['t111b_ml']  = des("T1", "Bulk cell (only grainA 48 atoms) without boundary correspondig to cell with T1.1 (1) twin with 64 atoms [Wang2012]")
-    struct_des['t111b_r']   = des("T1", "11-15 versions for optimization along x; Bulk cell with fitted lattice constants 2.9360 2.9360 4.6499 #angstrom fit_hex(0.0002,0.0003,400,600, 't111b_ml', '8301', range(1,17), calc) )")
-    struct_des['t111g']     = des("T1", "Cell with T1.1 (1) twin  3 periods along x; lateral sizes as in t111b_r; 5 versions of free volume 64 atoms [Wang2012]; ")
-    struct_des['t112g']     = des("T1", "Cell with T1.1 (2) twin, 4 periods along x; lateral sizes as in t111b_r; 5 versions of free volume 96 atoms [Wang2012]; ")
-    
-    struct_des['t111b']     = des("T1", "Bulk cell with initial lattice 't111b_r', full relaxation")
-    struct_des['t111bC']    = des("T1/C",  " t111b_ml with carbon v1-16"   )
-    struct_des['t111bC.f']    = des("T1/C",  " fitted v1"   )
-
-    struct_des['t111bO']    = des("T1/O",  " t111b_ml with oxygen v1-16; relaxed positions used from t111bC"   )
-    struct_des['t111bO.f.93kp9_template'] = des("T1/O",  " template without oxygen"   )
-    struct_des['t111bO.f'] = des("T1/O",  "from template with oxygen "   )
-
-    struct_des['t111gCv']    = des("T1/C",  " carbon in grain volume; v1-v5 volumes -0.3 0.5"   )
-    struct_des['t111gCi1']   = des("T1/C",  " carbon in place 1; v1-v5 volumes -0.3 0.5"   )
-    struct_des['t113gC_template'] = des("T1/C",  " empty template 96 atoms without carbon for preliminary relaxation of boundaries; v1-v5 volumes -0.3 0.5"   )
-    struct_des['t113gCi1']   = des("T1/C",  " carbon in the same place as t111gCi1; v2; vol -0.1"   )
-    struct_des['t113gCv']    = des("T1/C",  " carbon in the same place as t111gCv;  v2; vol -0.1"   )
-
-    struct_des['t113gCO_template'] = des("T1/CO",  " empty template 96 atoms without impurites; the same sizes as t111gCO; v1-v5 volumes -0.3 0.5"   )
-    struct_des['t113gCOi6.1-1is'] = des('T1/CO/t113g_coseg', 'co-segregation configurations; the same sizes as t111gCO '   )
-    struct_des['t113gCvOvms'] = des('T1/CO/t113g_gvol', 'corresponding configurations with impurities in volume; same sizes as t111gCO'   )
-
-    struct_des['t114g'] = des("T1",  "increased two times by r3 comparing to t111g; v1-v5 volumes -0.3 0.5"   )
-
-
-    struct_des['t112gCO_template'] = des("T1/CO/t112", 'empty template 96 atoms without impurites; sizes calculated with calc_ac; v1-v5 volumes -0.3 0.5'   )
-    struct_des['t112gCOi6.1-1is']  = des('T1/CO/t112', 'co-segregation configurations;'   )
-    struct_des['t112gCvOvms']      = des('T1/CO/t112', 'corresponding configurations with impurities in volume;'   )
-
-    struct_des['t114gCi1']   = des("T1/C",  " double of t111 by r3; 128 at; carbon in the same place as t111gCi1; v1-5; "   )
-    struct_des['t114gCv']    = des("T1/C",  " double of t111 by r3; 128 at; carbon in the same place as t111gCv;  v1-5; "   )
-    struct_des['t115gCi1']   = des("T1/C",  " double of t111 by r2; 128 at; carbon in the same place as t111gCi1; v1-5; vol -0.1"   )
-    struct_des['t115gCv']    = des("T1/C",  " double of t111 by r2; 128 at; carbon in the same place as t111gCv;  v1-5; vol -0.1"   )
-
-
-    struct_des['t111gO_template'] = des("T1/O",  " template without oxygen; lattice constants from t111bO.f"   )
-    struct_des['t111gOv']     = des("T1/O",  "oxygen in grain volume; v1-v5  "   )
-    struct_des['t111gOi1']    = des("T1/O",  " oxygen in place 1; v1-v5 "   )
-
-    struct_des['t111gCO_template']    = des('T1/CO', 'template without impurities'   )
-    struct_des['t111gCO_template_Cv'] = des('T1/CO', 'template with carbon in grain interior'   )
-    struct_des['t111gCO_template_segreg'] = des('T1/CO', 'template with correct rprimd; segreg -  carbon and oxygen in grain interior; '   )
-    struct_des['t111gCO_template_coseg'] = des('T1/CO', 'template with correct rprimd; coseg - pure'   )
-    struct_des['t111gCO_template_grainvol'] = des('T1/CO', 'template with correct rprimd; grainvol - carbon in grain interior'  )
-
-    struct_des['t111gCOv1'] = des('T1/CO/t111g_gvol', 'corresponding configurations with impurities in volume; made from t111gCv.93kp9'   )
-    struct_des['t111gCOv2'] = des('T1/CO/t111g_gvol', 'corresponding configurations with impurities in volume; made from t111gCv.93kp9'   )
-    struct_des['t111gCOv3is'] = des('T1/CO/t111g_gvol', 'corresponding configurations with impurities in volume; made from t111gCv.93kp9'   )
-    struct_des['t111gCOv4'] = des('T1/CO/t111g_gvol', 'corresponding configurations with impurities in volume; made from t111gCv.93kp9'   )
-    struct_des['t111gCOv5'] = des('T1/CO/t111g_gvol', 'corresponding configurations with impurities in volume; made from t111gCv.93kp9'   )
-    struct_des['t111gCOv6'] = des('T1/CO/t111g_gvol', 'corresponding configurations with impurities in volume; made from t111gCv.93kp9'   )
-    struct_des['t111gCvOvms'] = des('T1/CO/t111g_gvol', 'corresponding configurations with impurities in volume; made from t111gCv.93kp9'   )
-
-    struct_des['t111gCOi1.4-3'] = des('T1/CO/t111g_coseg', 'co-segregation configurations; made from t111g.9292'   )
-    struct_des['t111gCOi2.2-1'] = des('T1/CO/t111g_coseg', 'co-segregation configurations; made from t111g.9292'   )
-    struct_des['t111gCOi3.4-1'] = des('T1/CO/t111g_coseg', 'co-segregation configurations; made from t111g.9292'   )
-    struct_des['t111gCOi4.4-4is'] = des('T1/CO/t111g_coseg', 'co-segregation configurations; made from t111g.9292'   )
-    struct_des['t111gCOi5.2-2is'] = des('T1/CO/t111g_coseg', 'co-segregation configurations; made from t111g.9292'   )
-    struct_des['t111gCOi6.1-1is'] = des('T1/CO/t111g_coseg', 'co-segregation configurations; made from t111g.9292'   )
-    struct_des['t111gCOi7.3-3is'] = des('T1/CO/t111g_coseg', 'co-segregation configurations; made from t111g.9292'   )
-    struct_des['t111gCOi8.2-3'] = des('T1/CO/t111g_coseg', 'co-segregation configurations; made from t111g.9292'   )
-    struct_des['t111gCOi9.4-4ms'] = des('T1/CO/t111g_coseg', 'co-segregation configurations; made from t111g.9292'   )
-    struct_des['t111gCOi10.2-2ms'] = des('T1/CO/t111g_coseg', 'co-segregation configurations; made from t111g.9292'   )
-    struct_des['t111gCOi11.4-3'] = des('T1/CO/t111g_coseg', 'co-segregation configurations; made from t111g.9292'   )
-    struct_des['t111gCOi12.1-3'] = des('T1/CO/t111g_coseg', 'co-segregation configurations; made from t111g.9292'   )
-    struct_des['t111gCOi13.4-2'] = des('T1/CO/t111g_coseg', 'co-segregation configurations; made from t111g.9292'   )
-    struct_des['t111gCOi14.2-1'] = des('T1/CO/t111g_coseg', 'co-segregation configurations; made from t111g.9292'   )
-    struct_des['t111gCOi15.4-4is'] = des('T1/CO/t111g_coseg', 'co-segregation configurations; made from t111g.9292'   )
-    struct_des['t111gCOi16.2-2is'] = des('T1/CO/t111g_coseg', 'co-segregation configurations; made from t111g.9292'   )
-    struct_des['t111gOCi1.4-3'] = des('T1/CO/t111g_coseg', 'co-segregation configurations; made from t111g.9292'   )
-    struct_des['t111gOCi2.2-1'] = des('T1/CO/t111g_coseg', 'co-segregation configurations; made from t111g.9292'   )
-    struct_des['t111gOCi3.4-1'] = des('T1/CO/t111g_coseg', 'co-segregation configurations; made from t111g.9292'   )
-    struct_des['t111gOCi8.2-3'] = des('T1/CO/t111g_coseg', 'co-segregation configurations; made from t111g.9292'   )
-    struct_des['t111gOCi11.4-3'] = des('T1/CO/t111g_coseg', 'co-segregation configurations; made from t111g.9292'   )
-    struct_des['t111gOCi12.1-3'] = des('T1/CO/t111g_coseg', 'co-segregation configurations; made from t111g.9292'   )
-    struct_des['t111gOCi13.4-2'] = des('T1/CO/t111g_coseg', 'co-segregation configurations; made from t111g.9292'   )
-    struct_des['t111gOCi14.2-1'] = des('T1/CO/t111g_coseg', 'co-segregation configurations; made from t111g.9292'   )
-
-    struct_des['t111gCi1Ov'] = des('T1/CO/t111g_segreg', 'corresponding segregation configurations; made from t111gCv.93kp9'   )
-    struct_des['t111gCi2Ov'] = des('T1/CO/t111g_segreg', 'corresponding segregation configurations; made from t111gCv.93kp9'   )
-    struct_des['t111gCi3Ov'] = des('T1/CO/t111g_segreg', 'corresponding segregation configurations; made from t111gCv.93kp9'   )
-    struct_des['t111gCi4Ov'] = des('T1/CO/t111g_segreg', 'corresponding segregation configurations; made from t111gCv.93kp9'   )
-    struct_des['t111gOi1Cv'] = des('T1/CO/t111g_segreg', 'corresponding segregation configurations; made from t111gCv.93kp9'   )
-    struct_des['t111gOi2Cv'] = des('T1/CO/t111g_segreg', 'corresponding segregation configurations; made from t111gCv.93kp9'   )
-    struct_des['t111gOi3Cv'] = des('T1/CO/t111g_segreg', 'corresponding segregation configurations; made from t111gCv.93kp9'   )
-    struct_des['t111gOi4Cv'] = des('T1/CO/t111g_segreg', 'corresponding segregation configurations; made from t111gCv.93kp9'   )
-
-
-    struct_des['t111sg']     = des("T1", "Cell with T1.1 (1) twin, but with shift r2/2 along r2; lateral sizes as in t111b_r; v1-5; 64 atoms [Wang2012]; ")
-
-
-    struct_des['t111sgCO_template_coseg'] = des('T1/CO/shift', 'template with correct rprimd; segreg - carbon in grain interior; coseg - pure'   )
-    struct_des['t111sgCO_template_segreg'] = des('T1/CO/shift', 'template with correct rprimd; segreg - carbon in grain interior; coseg - pure'   )
-    struct_des['t111sgCO_template_grainvol'] = des('T1/CO/shift', 'template with correct rprimd; segreg - carbon in grain interior; coseg - pure'   )
-
-    struct_des['t111sgCvOvms'] = des('T1/CO/shift/t111sg_gvol', 'corresponding configurations with impurities in volume; made from t111sg.93kp9'   )
-    struct_des['t111sgCOv6'  ] = des('T1/CO/shift/t111sg_gvol', 'corresponding configurations with impurities in volume; made from csl71sg15.93'   )
-    struct_des['t111sgCOv2'  ] = des('T1/CO/shift/t111sg_gvol', 'corresponding configurations with impurities in volume; made from csl71sg15.93'   )
-
-
-    struct_des['t111sgCi1Ov'] = des('T1/CO/shift/t111sg_segreg', 'corresponding segregation configurations; made also from t111sg.93kp9'   )
-    struct_des['t111sgCi2Ov'] = des('T1/CO/shift/t111sg_segreg', 'corresponding segregation configurations; made also from t111sg.93kp9'   )
-    struct_des['t111sgCi3Ov'] = des('T1/CO/shift/t111sg_segreg', 'corresponding segregation configurations; made also from t111sg.93kp9'   )
-    struct_des['t111sgCi4Ov'] = des('T1/CO/shift/t111sg_segreg', 'corresponding segregation configurations; made also from t111sg.93kp9'   )
-    struct_des['t111sgCi5Ov'] = des('T1/CO/shift/t111sg_segreg', 'corresponding segregation configurations; made also from t111sg.93kp9'   )
-    struct_des['t111sgCi6Ov'] = des('T1/CO/shift/t111sg_segreg', 'corresponding segregation configurations; made also from t111sg.93kp9'   )
-    struct_des['t111sgCi7Ov'] = des('T1/CO/shift/t111sg_segreg', 'corresponding segregation configurations; made also from t111sg.93kp9'   )
-    struct_des['t111sgOi1Cv'] = des('T1/CO/shift/t111sg_segreg', 'corresponding segregation configurations; made also from t111sg.93kp9'   )
-    struct_des['t111sgOi2Cv'] = des('T1/CO/shift/t111sg_segreg', 'corresponding segregation configurations; made also from t111sg.93kp9'   )
-    struct_des['t111sgOi3Cv'] = des('T1/CO/shift/t111sg_segreg', 'corresponding segregation configurations; made also from t111sg.93kp9'   )
-    struct_des['t111sgOi4Cv'] = des('T1/CO/shift/t111sg_segreg', 'corresponding segregation configurations; made also from t111sg.93kp9'   )
-    struct_des['t111sgOi5Cv'] = des('T1/CO/shift/t111sg_segreg', 'corresponding segregation configurations; made also from t111sg.93kp9'   )
-    struct_des['t111sgOi6Cv'] = des('T1/CO/shift/t111sg_segreg', 'corresponding segregation configurations; made also from t111sg.93kp9'   )
-    struct_des['t111sgOi7Cv'] = des('T1/CO/shift/t111sg_segreg', 'corresponding segregation configurations; made also from t111sg.93kp9'   )
-
-
-
-    struct_des['t111sgCOi17.7-4'] = des('T1/CO/shift/t111sg_coseg', 'co-segregation configurations; made from t111sg.93kp9'   )
-    struct_des['t111sgCOi28.4-5'] = des('T1/CO/shift/t111sg_coseg', 'co-segregation configurations; made from t111sg.93kp9'   )
-    struct_des['t111sgCOi29.4-6'] = des('T1/CO/shift/t111sg_coseg', 'co-segregation configurations; made from t111sg.93kp9'   )
-    struct_des['t111sgCOi30.7-5'] = des('T1/CO/shift/t111sg_coseg', 'co-segregation configurations; made from t111sg.93kp9'   )
-    struct_des['t111sgOCi8.4-7'  ] = des('T1/CO/shift/t111sg_coseg', 'co-segregation configurations; made from t111sg.93kp9'   )
-    struct_des['t111sgOCi9.6-2' ] = des('T1/CO/shift/t111sg_coseg', 'co-segregation configurations; made from t111sg.93kp9'   )
-    struct_des['t111sgOCi15.6-6'] = des('T1/CO/shift/t111sg_coseg', 'co-segregation configurations; made from t111sg.93kp9'   )
-    struct_des['t111sgOCi22.6-3'] = des('T1/CO/shift/t111sg_coseg', 'co-segregation configurations; made from t111sg.93kp9'   )
-    struct_des['t111sgOCi25.6-7'] = des('T1/CO/shift/t111sg_coseg', 'co-segregation configurations; made from t111sg.93kp9'   )
-    struct_des['t111sgOCi27.6-2'] = des('T1/CO/shift/t111sg_coseg', 'co-segregation configurations; made from t111sg.93kp9'   )
-
-
-
-
-
-
-
-
-
-
-
-    struct_des['t21b_ml']   = des("T2", "Bulk cell (only grainA 44 atoms) without boundary correspondig to cell with T2 (1) twin with 64 atoms [Lane2011]; versions 1-16")
-    struct_des['t21bC']     = des("T2/C",  " t21b_ml with carbon v1-16"   )
-    struct_des['t21bC.f']   = des("T2/C",  " fitted v1"   )
-
-    struct_des['t21bO_template'] = des("T2/O",  " template without oxygen; lattice constants from t111bO.f"   )
-    struct_des['t21bO']     = des("T2/O",  "v1-16 from t21bC; from template with added oxygen v20 "   )
-    struct_des['t21bO.f']   = des("T2/O",  " fitted v1"   )
-
-
-    struct_des['t21b_r']    = des("T2", "Bulk Ti acell 2.9380 2.9380 4.6427 #after fit_hex(0.0002,0.0003,400,600, 't21b_ml', '83', range(1,17), calc) correspondig to cell with T2 (1) twin with 64 atoms [Lane2011]")
-    struct_des['t21g']      = des("T2", "Cell with T2 (1) twin with 64 atoms [Lane2011]; v 1-5 -0.3 +0.3")
-    struct_des['t21gCv']    = des("T2/C",  " carbon in grain volume; v1-v5 the same as t21g"   )
-    struct_des['t21gCi1']   = des("T2/C",  " carbon in place 1; v1-v5 the same as t21g"   )
-
-    struct_des['t21gO_template'] = des("T2/O",  " template without oxygen; lattice constants from t111bO.f"   )
-    struct_des['t21gOv']     = des("T2/O",  "oxygen in grain volume; v1-v5  "   )
-    struct_des['t21gOi1']    = des("T2/O",  " oxygen in place 1; v1-v5 "   )
-
-    struct_des['t21gCO_template_grainvol'] = des('T2/CO', 'template with correct rprimd; segreg - carbon in grain interior; coseg - pure'   )
-    struct_des['t21gCO_template_coseg'] = des('T2/CO', 'template with correct rprimd; segreg - carbon in grain interior; coseg - pure'   )
-    struct_des['t21gCO_template_segreg'] = des('T2/CO', 'template with correct rprimd; segreg - carbon in grain interior; coseg - pure'   )
-
-    struct_des['t21gCOv2'] = des('T2/CO/t21g_gvol', 'corresponding configurations with impurities in volume; made from t21gCv.93'   )
-    struct_des['t21gCOv6'] = des('T2/CO/t21g_gvol', 'corresponding configurations with impurities in volume; made from t21gCv.93'   )
-    struct_des['t21gCvOvms'] = des('T2/CO/t21g_gvol', 'corresponding configurations with impurities in volume; made from t21gCv.93'   )
-
-
-    struct_des['t21gCOi1.4-3' ] = des('T2/CO/t21g_coseg', 'co-segregation configurations; made from t21g.93'   )
-    struct_des['t21gCOi2.3-2' ] = des('T2/CO/t21g_coseg', 'co-segregation configurations; made from t21g.93'   )
-    struct_des['t21gCOi3.2-2' ] = des('T2/CO/t21g_coseg', 'co-segregation configurations; made from t21g.93'   )
-    struct_des['t21gCOi4.2-1' ] = des('T2/CO/t21g_coseg', 'co-segregation configurations; made from t21g.93'   )
-    struct_des['t21gCOi5.3-1' ] = des('T2/CO/t21g_coseg', 'co-segregation configurations; made from t21g.93'   )
-    struct_des['t21gCOi6.4-2' ] = des('T2/CO/t21g_coseg', 'co-segregation configurations; made from t21g.93'   )
-    struct_des['t21gCOi7.2-1' ] = des('T2/CO/t21g_coseg', 'co-segregation configurations; made from t21g.93'   )
-    struct_des['t21gCOi8.4-1' ] = des('T2/CO/t21g_coseg', 'co-segregation configurations; made from t21g.93'   )
-    struct_des['t21gCOi9.4-2' ] = des('T2/CO/t21g_coseg', 'co-segregation configurations; made from t21g.93'   )
-    struct_des['t21gCOi10.3-3'] = des('T2/CO/t21g_coseg', 'co-segregation configurations; made from t21g.93'   )
-    struct_des['t21gCOi11.4-3'] = des('T2/CO/t21g_coseg', 'co-segregation configurations; made from t21g.93'   )
-    struct_des['t21gCOi12.3-2'] = des('T2/CO/t21g_coseg', 'co-segregation configurations; made from t21g.93'   )
-    struct_des['t21gCOi13.4-1'] = des('T2/CO/t21g_coseg', 'co-segregation configurations; made from t21g.93'   )
-    struct_des['t21gCOi14.1-4'] = des('T2/CO/t21g_coseg', 'co-segregation configurations; made from t21g.93'   )
-    struct_des['t21gCOi15.3-2'] = des('T2/CO/t21g_coseg', 'co-segregation configurations; made from t21g.93'   )
-    struct_des['t21gCOi16.4-2'] = des('T2/CO/t21g_coseg', 'co-segregation configurations; made from t21g.93'   )
-    struct_des['t21gOCi1.4-3' ] = des('T2/CO/t21g_coseg', 'co-segregation configurations; made from t21g.93'   )
-    struct_des['t21gOCi2.3-2' ] = des('T2/CO/t21g_coseg', 'co-segregation configurations; made from t21g.93'   )
-    struct_des['t21gOCi3.2-2' ] = des('T2/CO/t21g_coseg', 'co-segregation configurations; made from t21g.93'   )
-    struct_des['t21gOCi4.2-1' ] = des('T2/CO/t21g_coseg', 'co-segregation configurations; made from t21g.93'   )
-    struct_des['t21gOCi5.3-1' ] = des('T2/CO/t21g_coseg', 'co-segregation configurations; made from t21g.93'   )
-    struct_des['t21gOCi6.4-2' ] = des('T2/CO/t21g_coseg', 'co-segregation configurations; made from t21g.93'   )
-    struct_des['t21gOCi7.2-1' ] = des('T2/CO/t21g_coseg', 'co-segregation configurations; made from t21g.93'   )
-    struct_des['t21gOCi8.4-1' ] = des('T2/CO/t21g_coseg', 'co-segregation configurations; made from t21g.93'   )
-    struct_des['t21gOCi9.4-2' ] = des('T2/CO/t21g_coseg', 'co-segregation configurations; made from t21g.93'   )
-    struct_des['t21gOCi10.3-3'] = des('T2/CO/t21g_coseg', 'co-segregation configurations; made from t21g.93'   )
-    struct_des['t21gOCi11.4-3'] = des('T2/CO/t21g_coseg', 'co-segregation configurations; made from t21g.93'   )
-    struct_des['t21gOCi12.3-2'] = des('T2/CO/t21g_coseg', 'co-segregation configurations; made from t21g.93'   )
-    struct_des['t21gOCi13.4-1'] = des('T2/CO/t21g_coseg', 'co-segregation configurations; made from t21g.93'   )
-    struct_des['t21gOCi14.1-4'] = des('T2/CO/t21g_coseg', 'co-segregation configurations; made from t21g.93'   )
-    struct_des['t21gOCi15.3-2'] = des('T2/CO/t21g_coseg', 'co-segregation configurations; made from t21g.93'   )
-    struct_des['t21gOCi16.4-2'] = des('T2/CO/t21g_coseg', 'co-segregation configurations; made from t21g.93'   )
-
-    struct_des['t21gCi1Ov'] = des('T2/CO/t21g_segreg', 'corresponding segregation configurations; made also from t21g.93'   )
-    struct_des['t21gCi2Ov'] = des('T2/CO/t21g_segreg', 'corresponding segregation configurations; made also from t21g.93'   )
-    struct_des['t21gCi3Ov'] = des('T2/CO/t21g_segreg', 'corresponding segregation configurations; made also from t21g.93'   )
-    struct_des['t21gCi4Ov'] = des('T2/CO/t21g_segreg', 'corresponding segregation configurations; made also from t21g.93'   )
-    struct_des['t21gOi1Cv'] = des('T2/CO/t21g_segreg', 'corresponding segregation configurations; made also from t21g.93'   )
-    struct_des['t21gOi2Cv'] = des('T2/CO/t21g_segreg', 'corresponding segregation configurations; made also from t21g.93'   )
-    struct_des['t21gOi3Cv'] = des('T2/CO/t21g_segreg', 'corresponding segregation configurations; made also from t21g.93'   )
-    struct_des['t21gOi4Cv'] = des('T2/CO/t21g_segreg', 'corresponding segregation configurations; made also from t21g.93'   )
-
-
-
-
-
-
-
-
-
-
-
-    struct_des['csl71b_r']  = des("CSL7", "bulk; 56 atoms; corresponds to csl71g; a from t111b, c from hs221")
-    struct_des['csl71bC']  = des("CSL7/C", "bulk; 57 atoms; Lattice constants as csl71b_r; to check voronoi volume of ideal octapore ")
-
-    struct_des['csl71g']    = des("CSL7", "twin; v2-6; 52 atoms; a from t111b, c from hs221")
-    struct_des['csl71sg5']    = des("CSL7", "twin shifted; v5-1; 52 atoms; a from t111b, c from hs221")
-    struct_des['csl71sg10']    = des("CSL7", "twin shifted; v5-1; 52 atoms; a from t111b, c from hs221")
-    struct_des['csl71sg15']    = des("CSL7", "twin shifted; v5-1; 52 atoms; a from t111b, c from hs221")
-    struct_des['csl71sg10z2y']    = des("CSL7", "twin shifted; v5-1; 52 atoms; a from t111b, c from hs221")
-
-
-    struct_des['csl71sg15CO_template_grainvol'] = des('CSL7/CO', 'template with correct rprimd; segreg - carbon in grain interior; coseg - pure'   )
-    struct_des['csl71sg15CO_template_coseg'] = des('CSL7/CO', 'template with correct rprimd; segreg - carbon in grain interior; coseg - pure'   )
-    struct_des['csl71sg15CO_template_segreg'] = des('CSL7/CO', 'template with correct rprimd; segreg - carbon in grain interior; coseg - pure'   )
-
-
-    struct_des['csl71sgCvOvms'] = des('CSL7/CO/csl71sg_gvol', 'corresponding configurations with impurities in volume; made from csl71sg15.93'   )
-
-    struct_des['csl71sgCOv5'] = des('CSL7/CO/csl71sg_gvol', 'corresponding configurations with impurities in volume; made from csl71sg15.93'   )
-    struct_des['csl71sgCOv9'] = des('CSL7/CO/csl71sg_gvol', 'corresponding configurations with impurities in volume; made from csl71sg15.93'   )
-
-    struct_des['csl71sgCi1Ov'] = des('CSL7/CO/csl71sg_segreg', 'corresponding segregation configurations; made also from csl71sg15.93'   )
-    struct_des['csl71sgCi2Ov'] = des('CSL7/CO/csl71sg_segreg', 'corresponding segregation configurations; made also from csl71sg15.93'   )
-    struct_des['csl71sgCi3Ov'] = des('CSL7/CO/csl71sg_segreg', 'corresponding segregation configurations; made also from csl71sg15.93'   )
-    struct_des['csl71sgCi4Ov'] = des('CSL7/CO/csl71sg_segreg', 'corresponding segregation configurations; made also from csl71sg15.93'   )
-    struct_des['csl71sgCi5Ov'] = des('CSL7/CO/csl71sg_segreg', 'corresponding segregation configurations; made also from csl71sg15.93'   )
-    struct_des['csl71sgCi6Ov'] = des('CSL7/CO/csl71sg_segreg', 'corresponding segregation configurations; made also from csl71sg15.93'   )
-    struct_des['csl71sgOi1Cv'] = des('CSL7/CO/csl71sg_segreg', 'corresponding segregation configurations; made also from csl71sg15.93'   )
-    struct_des['csl71sgOi2Cv'] = des('CSL7/CO/csl71sg_segreg', 'corresponding segregation configurations; made also from csl71sg15.93'   )
-    struct_des['csl71sgOi3Cv'] = des('CSL7/CO/csl71sg_segreg', 'corresponding segregation configurations; made also from csl71sg15.93'   )
-    struct_des['csl71sgOi4Cv'] = des('CSL7/CO/csl71sg_segreg', 'corresponding segregation configurations; made also from csl71sg15.93'   )
-    struct_des['csl71sgOi5Cv'] = des('CSL7/CO/csl71sg_segreg', 'corresponding segregation configurations; made also from csl71sg15.93'   )
-    struct_des['csl71sgOi6Cv'] = des('CSL7/CO/csl71sg_segreg', 'corresponding segregation configurations; made also from csl71sg15.93'   )
-
-
-
-    struct_des['csl71sgCOi1.6-4' ] = des('CSL7/CO/csl71sg_coseg', 'co-segregation configurations; made from csl71sg15.93'   )
-    struct_des['csl71sgCOi11.4-4'] = des('CSL7/CO/csl71sg_coseg', 'co-segregation configurations; made from csl71sg15.93'   )
-    struct_des['csl71sgCOi22.1-2'] = des('CSL7/CO/csl71sg_coseg', 'co-segregation configurations; made from csl71sg15.93'   )
-    struct_des['csl71sgOCi6.5-4'  ] = des('CSL7/CO/csl71sg_coseg', 'co-segregation configurations; made from csl71sg15.93'   )
-    struct_des['csl71sgOCi7.1-6'  ] = des('CSL7/CO/csl71sg_coseg', 'co-segregation configurations; made from csl71sg15.93'   )
-
-
-    struct_des['csl77gCv']  = des("CSL7/C", "carbon at GB; from abinit")
-    struct_des['csl77gCi6']    = des("CSL7/C", "carbon in bulk; from abinit")
-    struct_des['csl77gCi7']    = des("CSL7/C", "testing search of pores in csl77gCv;")
-    struct_des['csl77gCv.m']  = des("CSL7/C",    "noimp; v1")
-    struct_des['csl77gCi6.m']    = des("CSL7/C", "noimp; v1")
-
-
-    #without imp:
-    struct_des['t111gCvOvms.m'] = des('T1/CO/t111g_segreg_m', 'without imp; made from t111gCvOvms.93kp9; ver are the same'   )
-    struct_des['t111gCi1Ov.m'] = des('T1/CO/t111g_segreg_m', 'without imp; made from t111gCi1Ov.93kp9; ver are the same'   )
-    struct_des['t111gCi2Ov.m'] = des('T1/CO/t111g_segreg_m', 'without imp; made from t111gCi2Ov.93kp9; ver are the same'   )
-    struct_des['t111gCi3Ov.m'] = des('T1/CO/t111g_segreg_m', 'without imp; made from t111gCi3Ov.93kp9; ver are the same'   )
-    struct_des['t111gCi4Ov.m'] = des('T1/CO/t111g_segreg_m', 'without imp; made from t111gCi4Ov.93kp9; ver are the same'   )
-    struct_des['t111gOi1Cv.m'] = des('T1/CO/t111g_segreg_m', 'without imp; made from t111gOi1Cv.93kp9; ver are the same'   )
-    struct_des['t111gOi2Cv.m'] = des('T1/CO/t111g_segreg_m', 'without imp; made from t111gOi2Cv.93kp9; ver are the same'   )
-    struct_des['t111gOi3Cv.m'] = des('T1/CO/t111g_segreg_m', 'without imp; made from t111gOi3Cv.93kp9; ver are the same'   )
-    struct_des['t111gOi4Cv.m'] = des('T1/CO/t111g_segreg_m', 'without imp; made from t111gOi4Cv.93kp9; ver are the same'   )
-    struct_des['t111sgCvOvms.m'] = des('T1/CO/t111sg_segreg_m', 'without imp; made from t111sgCvOvms.93kp9; ver are the same'   )
-    struct_des['t111sgCi1Ov.m'] = des('T1/CO/t111sg_segreg_m', 'without imp; made from t111sgCi1Ov.93kp9; ver are the same'   )
-    struct_des['t111sgCi2Ov.m'] = des('T1/CO/t111sg_segreg_m', 'without imp; made from t111sgCi2Ov.93kp9; ver are the same'   )
-    struct_des['t111sgCi3Ov.m'] = des('T1/CO/t111sg_segreg_m', 'without imp; made from t111sgCi3Ov.93kp9; ver are the same'   )
-    struct_des['t111sgCi4Ov.m'] = des('T1/CO/t111sg_segreg_m', 'without imp; made from t111sgCi4Ov.93kp9; ver are the same'   )
-    struct_des['t111sgCi5Ov.m'] = des('T1/CO/t111sg_segreg_m', 'without imp; made from t111sgCi5Ov.93kp9; ver are the same'   )
-    struct_des['t111sgCi6Ov.m'] = des('T1/CO/t111sg_segreg_m', 'without imp; made from t111sgCi6Ov.93kp9; ver are the same'   )
-    struct_des['t111sgCi7Ov.m'] = des('T1/CO/t111sg_segreg_m', 'without imp; made from t111sgCi7Ov.93kp9; ver are the same'   )
-    struct_des['t111sgOi1Cv.m'] = des('T1/CO/t111sg_segreg_m', 'without imp; made from t111sgOi1Cv.93kp9; ver are the same'   )
-    struct_des['t111sgOi2Cv.m'] = des('T1/CO/t111sg_segreg_m', 'without imp; made from t111sgOi2Cv.93kp9; ver are the same'   )
-    struct_des['t111sgOi3Cv.m'] = des('T1/CO/t111sg_segreg_m', 'without imp; made from t111sgOi3Cv.93kp9; ver are the same'   )
-    struct_des['t111sgOi4Cv.m'] = des('T1/CO/t111sg_segreg_m', 'without imp; made from t111sgOi4Cv.93kp9; ver are the same'   )
-    struct_des['t111sgOi5Cv.m'] = des('T1/CO/t111sg_segreg_m', 'without imp; made from t111sgOi5Cv.93kp9; ver are the same'   )
-    struct_des['t111sgOi6Cv.m'] = des('T1/CO/t111sg_segreg_m', 'without imp; made from t111sgOi6Cv.93kp9; ver are the same'   )
-    struct_des['t111sgOi7Cv.m'] = des('T1/CO/t111sg_segreg_m', 'without imp; made from t111sgOi7Cv.93kp9; ver are the same'   )
-    struct_des['c1gCvOvms.m'] = des('C1/CO/c1g_segreg_m', 'without imp; made from c1gCvOvms.93kp7; ver are the same'   )
-    struct_des['c1gCi1Ov.m'] = des('C1/CO/c1g_segreg_m', 'without imp; made from c1gCi1Ov.93kp7; ver are the same'   )
-    struct_des['c1gCi2Ov.m'] = des('C1/CO/c1g_segreg_m', 'without imp; made from c1gCi2Ov.93kp7; ver are the same'   )
-    struct_des['c1gOi1Cv.m'] = des('C1/CO/c1g_segreg_m', 'without imp; made from c1gOi1Cv.93kp7; ver are the same'   )
-    struct_des['c1gOi2Cv.m'] = des('C1/CO/c1g_segreg_m', 'without imp; made from c1gOi2Cv.93kp7; ver are the same'   )
-    struct_des['t21gCvOvms.m'] = des('T2/CO/t21g_segreg_m', 'without imp; made from t21gCvOvms.93; ver are the same'   )
-    struct_des['t21gCi1Ov.m'] = des('T2/CO/t21g_segreg_m', 'without imp; made from t21gCi1Ov.93; ver are the same'   )
-    struct_des['t21gCi2Ov.m'] = des('T2/CO/t21g_segreg_m', 'without imp; made from t21gCi2Ov.93; ver are the same'   )
-    struct_des['t21gCi3Ov.m'] = des('T2/CO/t21g_segreg_m', 'without imp; made from t21gCi3Ov.93; ver are the same'   )
-    struct_des['t21gCi4Ov.m'] = des('T2/CO/t21g_segreg_m', 'without imp; made from t21gCi4Ov.93; ver are the same'   )
-    struct_des['t21gOi1Cv.m'] = des('T2/CO/t21g_segreg_m', 'without imp; made from t21gOi1Cv.93; ver are the same'   )
-    struct_des['t21gOi2Cv.m'] = des('T2/CO/t21g_segreg_m', 'without imp; made from t21gOi2Cv.93; ver are the same'   )
-    struct_des['t21gOi3Cv.m'] = des('T2/CO/t21g_segreg_m', 'without imp; made from t21gOi3Cv.93; ver are the same'   )
-    struct_des['t21gOi4Cv.m'] = des('T2/CO/t21g_segreg_m', 'without imp; made from t21gOi4Cv.93; ver are the same'   )
-    struct_des['csl71sgCvOvms.m'] = des('CSL7/CO/csl71sg_segreg_m', 'without imp; made from csl71sgCvOvms.93; ver are the same'   )
-    struct_des['csl71sgCi1Ov.m'] = des('CSL7/CO/csl71sg_segreg_m', 'without imp; made from csl71sgCi1Ov.93; ver are the same'   )
-    struct_des['csl71sgCi2Ov.m'] = des('CSL7/CO/csl71sg_segreg_m', 'without imp; made from csl71sgCi2Ov.93; ver are the same'   )
-    struct_des['csl71sgCi3Ov.m'] = des('CSL7/CO/csl71sg_segreg_m', 'without imp; made from csl71sgCi3Ov.93; ver are the same'   )
-    struct_des['csl71sgCi4Ov.m'] = des('CSL7/CO/csl71sg_segreg_m', 'without imp; made from csl71sgCi4Ov.93; ver are the same'   )
-    struct_des['csl71sgCi5Ov.m'] = des('CSL7/CO/csl71sg_segreg_m', 'without imp; made from csl71sgCi5Ov.93; ver are the same'   )
-    struct_des['csl71sgCi6Ov.m'] = des('CSL7/CO/csl71sg_segreg_m', 'without imp; made from csl71sgCi6Ov.93; ver are the same'   )
-    struct_des['csl71sgOi1Cv.m'] = des('CSL7/CO/csl71sg_segreg_m', 'without imp; made from csl71sgOi1Cv.93; ver are the same'   )
-    struct_des['csl71sgOi2Cv.m'] = des('CSL7/CO/csl71sg_segreg_m', 'without imp; made from csl71sgOi2Cv.93; ver are the same'   )
-    struct_des['csl71sgOi3Cv.m'] = des('CSL7/CO/csl71sg_segreg_m', 'without imp; made from csl71sgOi3Cv.93; ver are the same'   )
-    struct_des['csl71sgOi4Cv.m'] = des('CSL7/CO/csl71sg_segreg_m', 'without imp; made from csl71sgOi4Cv.93; ver are the same'   )
-    struct_des['csl71sgOi5Cv.m'] = des('CSL7/CO/csl71sg_segreg_m', 'without imp; made from csl71sgOi5Cv.93; ver are the same'   )
-    struct_des['csl71sgOi6Cv.m'] = des('CSL7/CO/csl71sg_segreg_m', 'without imp; made from csl71sgOi6Cv.93; ver are the same'   )
-
-
-    #Additional for dos
-    struct_des['c1gCi1Ov.r'] = des('C1/CO/c1g_segreg', 'relaxed'   )
-    struct_des['c1gCi2Ov.r'] = des('C1/CO/c1g_segreg', 'relaxed'   )
-    struct_des['c1gOi1Cv.r'] = des('C1/CO/c1g_segreg', 'relaxed'   )
-    struct_des['c1gOi2Cv.r'] = des('C1/CO/c1g_segreg', 'relaxed'   )
-    struct_des['t111gCi2Ov.r'] = des('T1/CO/t111g_segreg', 'relaxed'   )
-    struct_des['t111gCi3Ov.r'] = des('T1/CO/t111g_segreg', 'relaxed'   )
-    struct_des['t111gOi2Cv.r'] = des('T1/CO/t111g_segreg', 'relaxed'   )
-    struct_des['t111gOi3Cv.r'] = des('T1/CO/t111g_segreg', 'relaxed'   )
-    struct_des['t111sgCi6Ov.r'] = des('T1/CO/shift/t111sg_segreg', 'relaxed'   )
-    struct_des['t111sgOi6Cv.r'] = des('T1/CO/shift/t111sg_segreg', 'relaxed'   )
-    struct_des['csl71sgCi4Ov.r'] = des('CSL7/CO/csl71sg_segreg', 'relaxed'   )
-    struct_des['csl71sgOi4Cv.r'] = des('CSL7/CO/csl71sg_segreg', 'relaxed'   )
-
-    struct_des['t21gCi1Ov.r'] = des('T2/CO/t21g_segreg', 'relaxed'   )
-    struct_des['t21gCi4Ov.r'] = des('T2/CO/t21g_segreg', 'relaxed'   )
-    struct_des['t21gOi1Cv.r'] = des('T2/CO/t21g_segreg', 'relaxed'   )
-    struct_des['t21gOi4Cv.r'] = des('T2/CO/t21g_segreg', 'relaxed'   )
-
-
-
-    struct_des['t111gCi1Ov.r'] = des('T1/CO/t111g_segreg', 'relaxed'   )
-    struct_des['t111gCi4Ov.r'] = des('T1/CO/t111g_segreg', 'relaxed'   )
-    struct_des['t111gOi1Cv.r'] = des('T1/CO/t111g_segreg', 'relaxed'   )
-    struct_des['t111gOi4Cv.r'] = des('T1/CO/t111g_segreg', 'relaxed'   )
-    struct_des['t111sgCi1Ov.r'] = des('T1/CO/shift/t111sg_segreg', 'relaxed'   )
-    struct_des['t111sgCi2Ov.r'] = des('T1/CO/shift/t111sg_segreg', 'relaxed'   )
-    struct_des['t111sgCi3Ov.r'] = des('T1/CO/shift/t111sg_segreg', 'relaxed'   )
-    struct_des['t111sgCi4Ov.r'] = des('T1/CO/shift/t111sg_segreg', 'relaxed'   )
-    struct_des['t111sgCi5Ov.r'] = des('T1/CO/shift/t111sg_segreg', 'relaxed'   )
-    struct_des['t111sgCi7Ov.r'] = des('T1/CO/shift/t111sg_segreg', 'relaxed'   )
-    struct_des['t111sgOi1Cv.r'] = des('T1/CO/shift/t111sg_segreg', 'relaxed'   )
-    struct_des['t111sgOi2Cv.r'] = des('T1/CO/shift/t111sg_segreg', 'relaxed'   )
-    struct_des['t111sgOi3Cv.r'] = des('T1/CO/shift/t111sg_segreg', 'relaxed'   )
-    struct_des['t111sgOi4Cv.r'] = des('T1/CO/shift/t111sg_segreg', 'relaxed'   )
-    struct_des['t111sgOi5Cv.r'] = des('T1/CO/shift/t111sg_segreg', 'relaxed'   )
-    struct_des['t111sgOi7Cv.r'] = des('T1/CO/shift/t111sg_segreg', 'relaxed'   )
-    struct_des['t21gCi2Ov.r'] = des('T2/CO/t21g_segreg', 'relaxed'   )
-    struct_des['t21gCi3Ov.r'] = des('T2/CO/t21g_segreg', 'relaxed'   )
-    struct_des['t21gOi2Cv.r'] = des('T2/CO/t21g_segreg', 'relaxed'   )
-    struct_des['t21gOi3Cv.r'] = des('T2/CO/t21g_segreg', 'relaxed'   )
-
-
-
-
-
-    struct_des['c1gCvOvms.r'] = des('C1/CO/c1g_gvol', 'relaxed'   )
-    struct_des['t111sgCvOvms.r'] = des('T1/CO/shift/t111sg_gvol', 'relaxed'   )
-    struct_des['t111gCvOvms.r'] = des('T1/CO/t111g_gvol', 'relaxed'   )
-    struct_des['csl71sgCvOvms.r'] = des('CSL7/CO/csl71sg_gvol', 'relaxed'   )
-    struct_des['t21gCvOvms.r'] = des('T2/CO/t21g_gvol', 'relaxed'   )
-
-
-
-
-
-
-    #scaled 
-    struct_des['c1gCi1Ov.r2d'] = des('scaled', 'scaled only matrix; the sizes are doubled without any manipulations'   )
-    struct_des['c1gCi2Ov.r2d'] = des('scaled', 'scaled only matrix; the sizes are doubled without any manipulations'   )
-    struct_des['c1gOi2Cv.r2d'] = des('scaled', 'scaled only matrix; the sizes are doubled without any manipulations'   )
-    struct_des['c1gCvOvms.r2d'] = des('scaled', 'scaled only matrix; the sizes are doubled without any manipulations'   )
-    struct_des['t111sgCi6Ov.r2d'] = des('scaled', 'scaled only matrix; the sizes are doubled without any manipulations'   )
-    struct_des['t111sgOi6Cv.r2d'] = des('scaled', 'scaled only matrix; the sizes are doubled without any manipulations'   )
-    struct_des['t111sgCvOvms.r2d'] = des('scaled', 'scaled only matrix; the sizes are doubled without any manipulations'   )
-    struct_des['csl71sgCi4Ov.r2d'] = des('scaled', 'scaled only matrix; the sizes are doubled without any manipulations'   )
-    struct_des['csl71sgOi4Cv.r2d'] = des('scaled', 'scaled only matrix; the sizes are doubled without any manipulations'   )
-    struct_des['csl71sgCvOvms.r2d'] = des('scaled', 'scaled only matrix; the sizes are doubled without any manipulations'   )
-    struct_des['t21gCi4Ov.r2d'] = des('scaled', 'scaled only matrix; the sizes are doubled without any manipulations'   )
-    struct_des['t21gOi4Cv.r2d'] = des('scaled', 'scaled only matrix; the sizes are doubled without any manipulations'   )
-    struct_des['t21gCvOvms.r2d'] = des('scaled', 'scaled only matrix; the sizes are doubled without any manipulations'   )
-
-
-    struct_des['c1gCi1Ov.r3d'] = des('scaled', 'scaled only matrix; the sizes are doubled without any manipulations'   )
-    struct_des['c1gCi2Ov.r3d'] = des('scaled', 'scaled only matrix; the sizes are doubled without any manipulations'   )
-    struct_des['c1gOi2Cv.r3d'] = des('scaled', 'scaled only matrix; the sizes are doubled without any manipulations'   )
-    struct_des['c1gCvOvms.r3d'] = des('scaled', 'scaled only matrix; the sizes are doubled without any manipulations'   )
-    struct_des['t111sgCi6Ov.r3d'] = des('scaled', 'scaled only matrix; the sizes are doubled without any manipulations'   )
-    struct_des['t111sgOi6Cv.r3d'] = des('scaled', 'scaled only matrix; the sizes are doubled without any manipulations'   )
-    struct_des['t111sgCvOvms.r3d'] = des('scaled', 'scaled only matrix; the sizes are doubled without any manipulations'   )
-    struct_des['csl71sgCi4Ov.r3d'] = des('scaled', 'scaled only matrix; the sizes are doubled without any manipulations'   )
-    struct_des['csl71sgOi4Cv.r3d'] = des('scaled', 'scaled only matrix; the sizes are doubled without any manipulations'   )
-    struct_des['csl71sgCvOvms.r3d'] = des('scaled', 'scaled only matrix; the sizes are doubled without any manipulations'   )
-    struct_des['t21gCi4Ov.r3d'] = des('scaled', 'scaled only matrix; the sizes are doubled without any manipulations'   )
-    struct_des['t21gOi4Cv.r3d'] = des('scaled', 'scaled only matrix; the sizes are doubled without any manipulations'   )
-    struct_des['t21gCvOvms.r3d'] = des('scaled', 'scaled only matrix; the sizes are doubled without any manipulations'   )
-
-
-
-
-    struct_des['o1b']       = des("pure", "Ortogonal bulk cell for convergence tests")
-    struct_des['o1b_ml']    = des("pure",  "The same as o1b, but with 25 versions of lattice parameters \
-        for manual lattice (ml) search")
-
-    
-    struct_des['hs221']     = des("H",   "hexagonal cell with bulk Ti hcp; 8 atoms; ")
-    struct_des['hs221.f']   = des("H",   "fitted;")
-    struct_des['hs221C']    = des("H",   "hexagonal cell with bulk Ti hcp  and one carbon atom in central octapore; 9 atoms; ")
-    struct_des['hs221C.f']  = des("H",   "fitted by 16 cells; ")
-
-    struct_des['hs221O']    = des("H/O",   "hexagonal cell with bulk Ti hcp  and one oxygen atom in central octapore; 9 atoms; ")
-    struct_des['hs221O.f.93_template'] = des("H/O", "fitted template without oxygen")
-    struct_des['hs221O.f'] = des("H/O", "obtained from template by adding oxygen")
-    struct_des['hs221O.fr'] = des("H/O", "atomic positions were relaxed in previous calculations;")
-
-    struct_des['hs332']     = des("H",   "hexagonal cell with bulk Ti hcp; v1-16; 36 atoms; ")
-    struct_des['hs332.f']   = des("H",   "fitted 0.0002,0.0003,400,600; v1; 36 atoms; ")
-
-    struct_des['hs332C']    = des("H",   "one C in hexagonal cell with bulk Ti hcp; v1-16; 37 atoms; ")
-    struct_des['hs332C.f']  = des("H",   "fitted &0.0002 &0.0003 &400 &600; v1; 37 atoms; ")
-    
-    struct_des['hs332O']    = des("H/O",   "made from hs332C.93 by replacing impurity; v1-16; 37 atoms; ")
-    struct_des['hs332O.f.93_template'] = des("H/O", "fitted template without oxygen 36 atoms")
-    struct_des['hs332O.f']  = des("H/O",   "obtained from template by adding oxygen; v1; 37 atoms; ")
-
-
-    struct_des['hs443']     = des("H",   "hex cell with bulk Ti hcp; v1-16; v20; 96 atoms; ")
-    struct_des['hs443.f']     = des("H",   "fitted; 96 atoms; ")
-    struct_des['hs443C']    = des("H",   "one C in hexagonal cell with bulk Ti hcp; v1-16; 97 atoms; ")
-    struct_des['hs443C.r']    = des("H",   " relaxed; for DOS; one C in hexagonal cell with bulk Ti hcp; v1-16; 97 atoms; ")
-    struct_des['hs443C.f']  = des("H",   "fitted; v1; 97 atoms; ")
-    struct_des['hs443C.fm']  = des("H/C",   "fitted relaxed and C removed; v1; 96 atoms; ")
-    struct_des['hs443C.fr']  = des("H/C",   "fitted and relaxed; v1; 97 atoms; ")
-    struct_des['hs443C.m']  = des("H/C",   "without imp; v1-16 and v20 for fitted; 96 atoms; ")
-
-
-    struct_des['hs443O']    = des("H/O",   "made from hs443C.93 by replacing impurity; v1-16; 97 atoms; ")
-    struct_des['hs443O.r']    = des("H/O",   "relaxed; made from hs443C.93 by replacing impurity; v1-16; 97 atoms; ")
-    struct_des['hs443O.ur']    = des("H/O",   "unrelaxed; impurity added to hs443 ; v1-16; 97 atoms; ")
-
-    # struct_des['hs443O.f.93_template'] = des("H/O", "fitted template without oxygen 96 atoms")
-    struct_des['hs443O.f']  = des("H/O",   "obtained from template by adding oxygen; v1; 97 atoms; ")
-    struct_des['hs443O.fm']  = des("H/O",   "fitted relaxed and O removed; v1; 96 atoms; ")
-    struct_des['hs443O.fr']  = des("H/O",   "fitted and relaxed; v1; 97 atoms; ")
-    struct_des['hs443O.m']  = des("H/O",   "without imp; v1-16 and v20 for fitted; 96 atoms; ")
-    
-
-
-    struct_des['hs443CO_template']   = des("H/CO",   "template without impurities, used for charge density calc; v1; 96 atoms; ")
-    struct_des['hs443CO']   = des("H/CO",   "obtained from template by adding carbon and oxygen; v1-15 - different topo configurations; 98 atoms; ")
-    struct_des['hs443CO.m']   = des("H/CO",   "relaxed hs443CO but without impurities; v1-15  96 atoms; ")
-    
-    struct_des['hs443CC']   = des("H/CC",   "inherited from relaxed hs443CO by replacing; v1-15 - different topo configurations; 98 atoms; ")
-    struct_des['hs443OO']   = des("H/OO",   "inherited from relaxed hs443CO by replacing; v1-15 - different topo configurations; 98 atoms; ")
-
-    struct_des['hs443CO2']   = des("H/CO2",   "obtained from template by adding carbon and two oxygen; v1-15 - different topo configurations; 99 atoms; ")
-    struct_des['hs443C2O2']   = des("H/C2O2",   "obtained from template by adding two carbon and two oxygen; v1-42 - different topo configurations; 100 atoms; ")
-
-    struct_des['hs554']     = des("H",   "hex cell with bulk Ti hcp; v20; 200 atoms; ")
-    struct_des['hs554.f']   = des("H",   "v1 hex cell with bulk Ti hcp; fitted from v1-16; 200 atoms; ")
-
-
-    struct_des['hs554C']     = des("H/C",   "hex cell plus C; vol with calc_ac; v1; 201 atoms; ")
-    struct_des['hs554O']     = des("H/O",   "hex cell plus O; vol with calc_ac; v1; 201 atoms; ")
-    struct_des['hs554C.f']  = des("H/C",   "obtained from template by adding carbon; v1; 201 atoms; ")
-    struct_des['hs554O.f']  = des("H/O",   "obtained from template by adding carbon; v1; 201 atoms; ")
-
+    if 'Error!' in mystring:
+        print (mystring)
+        print ('Error! keyword was detected in message; invoking RuntimeError ')
+        # sys.exit()
+        raise RuntimeError
 
     return
 
-
-def red_prec(value, precision = 100.):
-    a = value * precision
-    return round(a)/1./precision
+printlog = print_and_log
 
 
 
+
+
+
+
+
+def runBash(cmd, env = None, detached = False):
+    """Input - string; Executes Bash commands and returns stdout
+Need: import subprocess
+    """
+    if detached:
+        stdout = None
+        stderr = None
+    else:
+        stdout = subprocess.PIPE
+        stderr = subprocess.STDOUT
+
+    printlog('running in BASH:', cmd, '\n')
+    # if 'sshpass' in cmd:
+    #     sys.exit()
+
+    my_env = os.environ.copy()
+    # my_env["PATH"] = "/opt/local/bin:/opt/local/sbin:" + my_env["PATH"]
+    p = subprocess.Popen(cmd, 
+        # executable='/bin/bash', 
+        shell=True, stdout=stdout, stderr = stderr, stdin = None, env = my_env)
+    # print (cmd)
+    # print 'Bash output is\n'+out
+    # print ( str(out, 'utf-8') ) 
+    out = ''
+    try:
+        out = p.stdout.read().strip()
+
+        out = str(out, 'utf-8')
+    except:
+        pass
+
+    return out  #This is the stdout from the shell command
+
+
+
+
+def run_win_cmd(cmd):
+    #example for windows
+    result = []
+    process = subprocess.Popen(cmd,
+                               shell=True,
+                               stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE)
+    for line in process.stdout:
+        result.append(line)
+    errcode = process.returncode
+    for line in result:
+        print(line)
+    if errcode is not None:
+        raise Exception('cmd %s failed, see above for details', cmd)
